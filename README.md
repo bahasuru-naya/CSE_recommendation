@@ -6,43 +6,7 @@ An end-to-end data pipeline and ML-powered stock recommendation engine for the *
 
 ---
 
-## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         CSE Recommendation System                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────┐     ┌──────────────┐     ┌───────────────────────────────┐   │
-│  │  CSE API │────▶│  Ingestors   │────▶│  TimescaleDB (cse_lake)       │   │
-│  │ (cse.lk) │     │  (requests)  │     │  raw → staging → core         │   │
-│  └──────────┘     └──────────────┘     │  → features → ml → app        │   │
-│                                        └────────────────┬──────────────┘   │
-│                                                         │                   │
-│                              ┌──────────────────────────▼──────────────┐   │
-│                              │   Decision Engine (src/engine/)          │   │
-│                              │   LightGBM · SHAP explainability         │   │
-│                              │   Market regime · Liquidity guards        │   │
-│                              │   ATR-based position sizing               │   │
-│                              └──────────────────────────┬──────────────┘   │
-│                                                         │                   │
-│                   ┌─────────────────────────────────────┼──────────────┐   │
-│                   │                                     │              │   │
-│            ┌──────▼──────┐                   ┌──────────▼──────┐      │   │
-│            │  FastAPI    │                   │  APScheduler    │      │   │
-│            │  REST API   │                   │  (cron jobs)    │      │   │
-│            └──────┬──────┘                   └─────────────────┘      │   │
-│                   │                                                     │   │
-│            ┌──────▼──────────────────────┐                             │   │
-│            │  React Dashboard (Vite)     │                             │   │
-│            │  Recommendation cards       │                             │   │
-│            │  Company logos (CSE CDN)    │                             │   │
-│            │  SHAP Explain modal         │                             │   │
-│            │  Portfolio tracker          │                             │   │
-│            └─────────────────────────────┘                             │   │
-│                                                                         │   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
 
 ### Database Schemas (Medallion Lake)
 
