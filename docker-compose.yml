@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: cse_timescaledb
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: cse_lake
+      POSTGRES_USER: cse_user
+      POSTGRES_PASSWORD: cse_password
+    volumes:
+      - cse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cse_user -d cse_lake"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  cse_pgdata:
+    driver: local

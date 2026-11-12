@@ -1,0 +1,95 @@
+# ==========================================
+# Byte-compiled / optimized / DLL files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# Distribution / packaging
+# ==========================================
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+
+# ==========================================
+# Unit test / coverage / cache
+# ==========================================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+smoke_test_results.json
+
+# ==========================================
+# Node / Frontend (React + Vite)
+# ==========================================
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==========================================
+# Environment variables & secrets
+# ==========================================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ==========================================
+# Database, Lakehouse & Local Parquet Data
+# ==========================================
+*.sqlite
+*.sqlite3
+*.duckdb
+*.parquet
+/data/
+/lakehouse/
+
+# ==========================================
+# Machine Learning Model Weight Artifacts
+# ==========================================
+models/*.pkl
+models/*.joblib
+*.pkl
+*.joblib
+models_registry/
+
+# ==========================================
+# Operating System & IDE
+# ==========================================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini

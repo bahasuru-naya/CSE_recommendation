@@ -1,0 +1,88 @@
+
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cse-recommendation"
+version = "0.1.0"
+description = "CSE (Colombo Stock Exchange) Stock Recommendation System — data lake, feature engineering, ML scoring & Telegram alerts."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # Core
+    "sqlalchemy[asyncio]>=2.0",
+    "psycopg2-binary>=2.9",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "requests>=2.31",
+    "tenacity>=8.2",
+    "apscheduler>=3.10",
+
+    # Machine Learning
+    "scikit-learn>=1.4",
+    "lightgbm>=4.3",
+    "shap>=0.45",
+
+    # API
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+
+    # Telegram Alerts
+    "python-telegram-bot>=21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["cse_recommendation*"]
+
+# --------------------------------------------------
+# Ruff - Python Linter and Formatter
+# --------------------------------------------------
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cse_recommendation"]
+
+# --------------------------------------------------
+# Mypy - Static Type Checking
+# --------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+
+# --------------------------------------------------
+# Pytest - Testing Configuration
+# --------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+python_classes = ["Test*"]

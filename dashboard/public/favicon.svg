@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <defs>
+    <linearGradient id="favBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="favBorder" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+    <linearGradient id="favAlpha" x1="10%" y1="90%" x2="90%" y2="10%">
+      <stop offset="0%" stop-color="#10b981" />
+      <stop offset="30%" stop-color="#06b6d4" />
+      <stop offset="70%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#60a5fa" />
+    </linearGradient>
+    <linearGradient id="favGold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fef08a" />
+      <stop offset="100%" stop-color="#f59e0b" />
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#favBg)" stroke="url(#favBorder)" stroke-width="2" />
+  
+  <rect x="18" y="38" width="3.5" height="10" rx="1.5" fill="#10b981" />
+  <rect x="24.5" y="32" width="3.5" height="16" rx="1.5" fill="#06b6d4" />
+  <rect x="31" y="25" width="3.5" height="23" rx="1.5" fill="#3b82f6" />
+
+  <path
+    d="M 46 22 C 40 38 34 46 25 46 C 17 46 12 40 12 32 C 12 23 18 17 26 17 C 33 17 39 23 44 32 L 50 14"
+    stroke="url(#favAlpha)"
+    stroke-width="4.2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M 42 14 L 50 14 L 50 22"
+    stroke="url(#favAlpha)"
+    stroke-width="4.2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <circle cx="52" cy="7" r="2.5" fill="url(#favGold)" />
+</svg>
