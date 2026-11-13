@@ -71,3 +71,57 @@ def test_cost_aware_backtester_deducts_fees():
     # Commission + SEC + CSE levies
     expected_one_way = 0.0115 + 0.0015 + 0.0004
     assert round(backtester.one_way_fee, 4) == round(expected_one_way, 4)
+
+
+def test_backtester_fills_next_open_marks_after_trade_and_compounds_benchmark():
+    dates = pd.bdate_range("2025-01-01", periods=3)
+    signals = pd.DataFrame([{
+        "trading_date": dates[0],
+        "symbol": "TEST",
+        "signal": "BUY",
+        "position_size_pct": 0.5,
+        "stop_pct": 0.10,
+        "target_pct": 0.10,
+    }])
+    prices = pd.DataFrame([
+        {"trading_date": dates[0], "symbol": "TEST", "open": 100, "high": 100, "low": 100, "close": 100},
+        {"trading_date": dates[1], "symbol": "TEST", "open": 100, "high": 105, "low": 99, "close": 102},
+        {"trading_date": dates[2], "symbol": "TEST", "open": 105, "high": 120, "low": 103, "close": 115},
+    ])
+    benchmark = pd.Series([0.01, 0.02], index=dates[1:])
+
+    metrics, history = CostAwareBacktester(initial_capital=100_000).run(
+        signals,
+        prices,
+        benchmark_returns=benchmark,
+        eval_start_date=dates[0],
+    )
+
+    expected_final = 100_000 - (500 * 100 * (1 + 0.0134)) + (500 * 110 * (1 - 0.0134))
+    assert metrics.total_trades == 1
+    assert metrics.final_capital == pytest.approx(expected_final)
+    assert history.iloc[-1]["portfolio_value"] == pytest.approx(expected_final)
+    assert metrics.benchmark_return_pct == pytest.approx(3.02)
+
+
+def test_backtester_ignores_signals_before_evaluation_window():
+    dates = pd.bdate_range("2025-01-01", periods=3)
+    signals = pd.DataFrame([{
+        "trading_date": dates[0],
+        "symbol": "TEST",
+        "signal": "BUY",
+        "position_size_pct": 0.5,
+    }])
+    prices = pd.DataFrame([
+        {"trading_date": day, "symbol": "TEST", "open": 100, "close": 100}
+        for day in dates
+    ])
+
+    metrics, _ = CostAwareBacktester(initial_capital=100_000).run(
+        signals,
+        prices,
+        eval_start_date=dates[1],
+    )
+
+    assert metrics.total_trades == 0
+    assert metrics.final_capital == 100_000

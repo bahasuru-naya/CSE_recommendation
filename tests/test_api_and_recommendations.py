@@ -1,9 +1,11 @@
 """End-to-End Tests for FastAPI Endpoints, Recommendations, and Portfolio Management."""
 
+import json
 from datetime import date
+
 import pytest
-from starlette.testclient import TestClient
 from sqlalchemy import text
+from starlette.testclient import TestClient
 
 from src.api.main import app
 from src.db import SessionLocal
@@ -58,10 +60,10 @@ def test_settings_endpoints(client):
 # 2. Recommendations Engine & Deduplication Tests
 # -----------------------------------------------------------------------------
 
-def test_recommendation_manager_deduplication_and_purge(db_session):
-    """Verify RecommendationManager dedupes symbols and purges old predictions."""
+def test_recommendation_manager_deduplicates_test_batch_without_purging_newer_rows(db_session):
+    """Verify duplicate test recommendations are deduplicated without deleting app data."""
     mgr = RecommendationManager(db_session)
-    t_date = date.today()
+    t_date = date(2000, 1, 1)
 
     # Create synthetic recommendations with intentional duplicate symbols
     batch = [
@@ -107,6 +109,68 @@ def test_recommendation_manager_deduplication_and_purge(db_session):
     db_session.commit()
 
 
+def test_recommendation_manager_sanitizes_non_finite_json_values():
+    class SessionStub:
+        def __init__(self):
+            self.insert_params = None
+            self.committed = False
+            self.rolled_back = False
+
+        def execute(self, statement, params=None):
+            if "INSERT INTO app.recommendations" in str(statement):
+                self.insert_params = params
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolled_back = True
+
+    session = SessionStub()
+    manager = RecommendationManager(session)
+    saved = manager.save_recommendations([{
+        "security_id": 1,
+        "symbol": "NAN.N0000",
+        "signal": "WATCH",
+        "reasons": {"impact": float("nan"), "nested": [float("inf"), float("-inf")]},
+    }])
+
+    reasons = json.loads(session.insert_params["reasons"])
+    assert saved == 1
+    assert reasons == {"impact": None, "nested": [None, None]}
+    assert session.committed
+    assert not session.rolled_back
+
+
+def test_recommendation_manager_rolls_back_and_surfaces_insert_errors():
+    class SessionStub:
+        def __init__(self):
+            self.committed = False
+            self.rolled_back = False
+
+        def execute(self, statement, params=None):
+            if "INSERT INTO app.recommendations" in str(statement):
+                raise RuntimeError("insert failed")
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolled_back = True
+
+    session = SessionStub()
+    manager = RecommendationManager(session)
+    with pytest.raises(RuntimeError, match="insert failed"):
+        manager.save_recommendations([{
+            "security_id": 1,
+            "symbol": "ERROR.N0000",
+            "signal": "WATCH",
+        }])
+
+    assert not session.committed
+    assert session.rolled_back
+
+
 def test_get_recommendations_no_duplicates(client):
     """Verify GET /api/recommendations/ returns strictly unique stock symbols."""
     res = client.get("/api/recommendations/?signal=ALL&limit=100")
@@ -134,7 +198,8 @@ def test_get_recommendations_by_signal(client):
     """Verify filtering recommendations by BUY signal."""
     res = client.get("/api/recommendations/?signal=BUY")
     assert res.status_code == 200
-    items = res.json()["data"]
+    payload = res.json()
+    items = payload["data"]
 
     for rec in items:
         assert rec["signal"] == "BUY"
@@ -158,7 +223,7 @@ def test_recommendation_execution_creates_open_position(client, db_session):
         "stop_loss": 32.0,
         "target_price": 42.0,
         "max_quantity": 250,
-        "recommendation_date": date.today(),
+        "recommendation_date": date(2000, 1, 1),
     }]
     mgr.save_recommendations(batch)
 

@@ -206,6 +206,21 @@ export function useRetrainModel() {
   });
 }
 
+export function useRetrainStatus(jobId) {
+  return useQuery({
+    queryKey: ['model-retrain-status', jobId],
+    queryFn: async () => {
+      const res = await api.get(`/models/retrain/status/${jobId}`);
+      return res.data;
+    },
+    enabled: Boolean(jobId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return !status || status === 'queued' || status === 'running' ? 1200 : false;
+    },
+  });
+}
+
 export function useGeneratePredictions() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -245,6 +260,30 @@ export function useUpdateSetting() {
   return useMutation({
     mutationFn: ({ key, value }) => api.put(`/settings/${key}`, { value }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
+  });
+}
+
+export function useTelegramSettings() {
+  return useQuery({
+    queryKey: ['telegram-settings'],
+    queryFn: async () => {
+      const res = await api.get('/settings/telegram');
+      return res.data;
+    },
+  });
+}
+
+export function useUpdateTelegramSettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (settings) => api.put('/settings/telegram', settings),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['telegram-settings'] }),
+  });
+}
+
+export function useTestTelegramSettings() {
+  return useMutation({
+    mutationFn: (settings) => api.post('/settings/telegram/test', settings),
   });
 }
 

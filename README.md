@@ -2,7 +2,7 @@
 
 An end-to-end quantitative trading, lakehouse data pipeline, and machine learning recommendation engine engineered specifically for the **Colombo Stock Exchange (CSE)**. 
 
-The platform ingests live and historical market data, engineers 25+ technical and fundamental alpha factors, trains leak-free gradient-boosted models (LightGBM + TreeSHAP), and delivers transparent, risk-managed stock signals through an interactive React dashboard and high-performance FastAPI service.
+The platform ingests live and historical market data, engineers 25+ technical and fundamental alpha factors, trains LightGBM models using purged chronological evaluation (LightGBM + TreeSHAP), and delivers transparent, risk-managed stock signals through an interactive React dashboard and high-performance FastAPI service.
 
 > **Free, Local & Self-Hosted** — Operates entirely on your own machine. Zero paid API keys, zero cloud vendor lock-in. Powered by PostgreSQL 16 + TimescaleDB (Medallion Lakehouse), Python 3.12, and React 18 + Tailwind CSS.
 
@@ -31,8 +31,8 @@ The platform ingests live and historical market data, engineers 25+ technical an
 ┌────────────────────────────────────────────────────────────────────────┐
 │               QUANTITATIVE ENGINE & DECISION PIPELINE                  │
 ├────────────────────────────────────────────────────────────────────────┤
-│  • ASPI 200-Day SMA Market Regime Filter (Bullish / Bearish gate)     │
-│  • Leak-free LightGBM Model with TimeSeriesSplit Cross-Validation       │
+│  • ASPI 100-Day SMA Market Regime Filter (Bullish / Bearish gate)     │
+│  • LightGBM with purged date-based holdout and walk-forward CV          │
 │  • 2.68% CSE Round-Trip Brokerage Fee Hurdle Deduction                 │
 │  • 1.5:1 Minimum Risk-to-Reward Ratio Constraint                      │
 │  • Minimum LKR 500,000 Average Daily Turnover Liquidity Guardrail      │
@@ -63,7 +63,7 @@ The platform ingests live and historical market data, engineers 25+ technical an
 | **Official CSE Logos** | Synced directly from official CSE Content Delivery Network |
 | **Time-Series Storage** | TimescaleDB Hypertables with local Asia/Colombo calendar alignment |
 | **Engineered Features** | 25+ leakage-free indicators (RSI, MACD, Bollinger Bands, ATR, Momentum) |
-| **Machine Learning Model** | LightGBM Binary Classifier with purged Walk-Forward Validation |
+| **Machine Learning Model** | LightGBM binary classifier with a purged chronological holdout |
 | **Model Explainability** | Per-stock TreeSHAP attribution with plain-English feature descriptions |
 | **Decision Gates** | 6-layer quantitative safety filter (Fee hurdle, Regime, Liquidity, R:R, Allocation) |
 | **Round-Trip Fee Hurdle** | 2.68% deducted prior to signal generation (broker, SEC, and government levies) |
@@ -76,12 +76,16 @@ The platform ingests live and historical market data, engineers 25+ technical an
 
 LankaAlpha AI converts statistical model probabilities into actionable investor signals (**BUY**, **SELL**, **HOLD**, **WATCH**) through six mandatory risk gates:
 
-1. **2.68% Fee Hurdle Rate**: Every trade in Sri Lanka incurs ~1.12% buying fees and ~1.56% selling fees (brokerage commissions, SEC regulatory levies, and government share transaction taxes). The model's expected forward return must exceed **2.68%** after all costs.
-2. **ASPI Market Regime Gate**: Evaluates the All Share Price Index against its 200-day Simple Moving Average. In bearish regimes, BUY thresholds are heightened to prevent buying into systemic market downturns.
-3. **Probability & Confidence Threshold**: Only stocks where model confidence exceeds **60.0%** are eligible for BUY recommendations.
+1. **Forward Alpha Target**: The model estimates the probability that a stock beats ASPI by more than the **2.68% round-trip cost hurdle** over the next 10 CSE trading sessions.
+2. **ASPI Market Regime Gate**: Evaluates the All Share Price Index against its 100-day Simple Moving Average and recent volatility; BUY recommendations are blocked in bearish or high-volatility regimes.
+3. **Probability & Confidence Threshold**: BUY recommendations require model confidence of at least **65.0%**; SELL recommendations use a **35.0%** or lower threshold.
 4. **Risk-to-Reward Ratio (≥ 1.5:1)**: Expected upside to the target price must be at least 1.5 times greater than downside exposure to the stop-loss level.
-5. **Liquidity Guardrail**: Requires minimum **LKR 500,000** 30-day average daily turnover to prevent slippage in illiquid counters.
-6. **Stop-Loss Protection**: Dynamic stop-loss is placed at **1.5 × ATR (14)** below entry price, and target price is placed at **2.5 × ATR (14)** above entry price.
+5. **Liquidity Guardrail**: Requires minimum **LKR 200,000** 20-day average daily turnover and 500-share average volume.
+6. **Stop-Loss Protection**: Dynamic stop-loss and target prices are set at **2 × ATR (14)** and **3 × ATR (14)**, respectively.
+
+Retraining uses the existing historical feature rows, calibrates probabilities on an earlier validation window, and reports UI-compatible metrics on a later untouched holdout. The newest successfully trained version is activated even when its evaluation gates do not pass; only the five newest versions of the CSE LightGBM model are retained.
+
+Model retraining uses the existing historical prices, ASPI data, and stored feature rows in the local database; it does not fetch data from the internet. Run the historical feature build once when stored features are missing. The dashboard starts training asynchronously and polls its progress endpoint for each stage, LightGBM iteration updates, and failure details.
 
 ---
 
@@ -260,6 +264,9 @@ python -m src.main daily
 uvicorn src.api.main:app --reload --port 8000
 ```
 
+The API starts the background pipeline scheduler automatically. Daily Telegram
+alerts are sent at the time configured under **Settings → Telegram Alerts**.
+
 ---
 
 ### Step 4 — Launch the Frontend Dashboard
@@ -292,15 +299,11 @@ Open your browser at **`http://localhost:5173`**.
 
 ## Testing & Quality Assurance
 
-LankaAlpha AI includes a comprehensive automated test suite verifying feature calculations, LightGBM model stability, leak-free training, API endpoints, and decision logic:
+LankaAlpha AI includes an automated test suite verifying feature calculations, LightGBM model stability, purged training splits, backtest timing, API endpoints, and decision logic:
 
 ```powershell
 .venv\Scripts\activate
 pytest tests/ -v
-```
-
-```
-============================== 34 passed in 8.3s ==============================
 ```
 
 Build the production frontend bundle:

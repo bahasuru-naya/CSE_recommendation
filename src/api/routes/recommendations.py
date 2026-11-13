@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -124,6 +125,7 @@ def get_recommendations(
         }
         for r in rows
     ]
+
     return {"total": total, "data": items}
 
 

@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes import data, models, portfolio, recommendations, settings, db_explorer
+from src.scheduler.jobs import PipelineScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,15 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup/shutdown tasks."""
+    scheduler = PipelineScheduler()
+    scheduler.start()
+    app.state.pipeline_scheduler = scheduler
     logger.info("CSE Recommendation API started.")
-    yield
-    logger.info("CSE Recommendation API shutting down.")
+    try:
+        yield
+    finally:
+        scheduler.stop()
+        logger.info("CSE Recommendation API shutting down.")
 
 
 app = FastAPI(

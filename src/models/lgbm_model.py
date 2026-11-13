@@ -5,12 +5,14 @@ from __future__ import annotations
 import io
 import logging
 import pickle
+from collections.abc import Callable
 from typing import Any
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import shap
+from sklearn.linear_model import LogisticRegression
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,7 @@ class CSELightGBMModel:
         self.params = {**self.DEFAULT_PARAMS, **(params or {})}
         self.model: lgb.Booster | None = None
         self.explainer: shap.TreeExplainer | None = None
+        self.calibrator: LogisticRegression | None = None
         # close-price series stored at training time for inference normalisation
         self._close_col_present: bool = False
 
@@ -116,7 +119,7 @@ class CSELightGBMModel:
         X = X.copy()
 
         close = None
-        for col in ("close", "price"):
+        for col in ("price", "close"):
             if col in X.columns:
                 close = X[col].replace(0, np.nan)
                 break
@@ -135,7 +138,7 @@ class CSELightGBMModel:
             else:
                 # Moving averages: express as % distance from current price
                 X[ratio_col] = (X[raw_col] / close) - 1.0
-            X.drop(columns=[raw_col], inplace=True, errors="ignore")
+            X = X.drop(columns=[raw_col], errors="ignore")
 
         # Drop the close / price column; it must not be a feature
         X = X.drop(columns=["close", "price"], errors="ignore")
@@ -154,12 +157,25 @@ class CSELightGBMModel:
     ) -> pd.Series:
         """Create forward-looking target for training only (never leak to features).
 
-        Target = 1 if (Stock_t+H / Stock_t - 1) > (ASPI_t+H / ASPI_t - 1) + round_trip_cost
+        Target = 1 if (Stock_t+H / Stock_t - 1) > (ASPI_t+H / ASPI_t - 1) + round_trip_cost.
+        Inputs must be aligned on the same trading-session dates.
         """
         stock_fwd_ret = stock_prices.shift(-horizon_days) / stock_prices - 1.0
         aspi_fwd_ret = aspi_prices.shift(-horizon_days) / aspi_prices - 1.0
         excess_return = stock_fwd_ret - aspi_fwd_ret
-        target = (excess_return > round_trip_cost).astype(int)
+        valid = (
+            stock_prices.notna()
+            & aspi_prices.notna()
+            & np.isfinite(stock_prices)
+            & np.isfinite(aspi_prices)
+            & stock_prices.gt(0)
+            & aspi_prices.gt(0)
+            & stock_fwd_ret.notna()
+            & aspi_fwd_ret.notna()
+            & np.isfinite(stock_fwd_ret)
+            & np.isfinite(aspi_fwd_ret)
+        )
+        target = (excess_return > round_trip_cost).where(valid).astype(float)
         return target
 
     # ------------------------------------------------------------------
@@ -172,19 +188,49 @@ class CSELightGBMModel:
         y_train: pd.Series,
         X_val: pd.DataFrame | None = None,
         y_val: pd.Series | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
         """Train LightGBM classifier with early stopping and class-imbalance handling.
 
         Steps
         -----
-        1. Normalise price-level features (SMA, EMA, MACD, Bollinger, ATR → ratios).
-        2. Compute ``scale_pos_weight`` from actual label distribution.
-        3. Train with early stopping on the validation set (not the training set).
-        4. Initialise SHAP explainer for inference.
+        1. Drop warm-up rows with NaN indicator values (RSI, volatility) so
+           misleading fill values from new listings (e.g. RSI=50, vol=0) are
+           excluded from training.  Production inference is unaffected: rows
+           with insufficient history will receive a neutral probability and the
+           caller should map them to WATCH.
+           # NOTE: src/features/technical.py still uses fillna(50.0) for RSI and
+           # fillna(0.0) for volatility.  Those should be changed to fillna(np.nan)
+           # so this warm-up mask actually fires.  Until that change is in place,
+           # the mask below acts as a safeguard for any NaN rows already present.
+        2. Normalise price-level features (SMA, EMA, MACD, Bollinger, ATR → ratios).
+        3. Compute ``scale_pos_weight`` from actual label distribution.
+        4. Train with early stopping on the validation set (not the training set).
+        5. Initialise SHAP explainer for inference.
         """
+        # Step 1 – drop warm-up rows that have NaN in key indicators to avoid
+        # misleading filled values (e.g. RSI filled with 50, volatility with 0)
+        # for stocks with insufficient price history from corrupting training.
+        # The warm-up period is RSI(14) + buffer = ~20 rows minimum.
+        WARMUP_COLS = ["rsi_14", "volatility_20d"]
+        warmup_mask = pd.Series(True, index=X_train.index)
+        for col in WARMUP_COLS:
+            if col in X_train.columns:
+                warmup_mask &= X_train[col].notna()
+        n_before = len(X_train)
+        X_train = X_train.loc[warmup_mask]
+        y_train = y_train.loc[warmup_mask]
+        n_dropped = n_before - len(X_train)
+        if n_dropped > 0:
+            logger.info(
+                "Warm-up filter: dropped %d rows with NaN RSI/volatility (insufficient history).",
+                n_dropped,
+            )
         # Step 1 – normalise
         X_train_norm = self._normalise_features(X_train)
         feature_cols = [c for c in self.FEATURE_COLUMNS if c in X_train_norm.columns]
+        if not feature_cols:
+            raise ValueError("Training data does not contain any supported model features.")
         X_train_clean = (
             X_train_norm[feature_cols]
             .apply(pd.to_numeric, errors="coerce")
@@ -192,9 +238,16 @@ class CSELightGBMModel:
         )
 
         # Step 2 – class-imbalance weight
+        if X_train.empty:
+            raise ValueError("No training rows remain after filtering insufficient feature history.")
+        if not X_train.index.equals(y_train.index):
+            raise ValueError("X_train and y_train must have matching indexes.")
+
         pos = int(y_train.sum())
         neg = int(len(y_train) - pos)
-        scale_pos_weight = neg / pos if pos > 0 else 3.5
+        if pos == 0 or neg == 0:
+            raise ValueError("Training labels must contain both positive and negative samples.")
+        scale_pos_weight = neg / pos
         logger.info(
             "Training: pos=%d neg=%d scale_pos_weight=%.2f", pos, neg, scale_pos_weight
         )
@@ -204,7 +257,17 @@ class CSELightGBMModel:
         train_data = lgb.Dataset(X_train_clean, label=y_train)
 
         valid_sets = []
+        callbacks = []
         if X_val is not None and y_val is not None and len(X_val) > 0:
+            if not X_val.index.equals(y_val.index):
+                raise ValueError("X_val and y_val must have matching indexes.")
+            val_mask = pd.Series(True, index=X_val.index)
+            for col in WARMUP_COLS:
+                if col in X_val.columns:
+                    val_mask &= X_val[col].notna()
+            X_val = X_val.loc[val_mask]
+            y_val = y_val.loc[val_mask]
+        if X_val is not None and y_val is not None and len(X_val) > 0 and y_val.nunique() > 1:
             X_val_norm = self._normalise_features(X_val)
             X_val_clean = (
                 X_val_norm.reindex(columns=feature_cols)
@@ -215,22 +278,30 @@ class CSELightGBMModel:
             valid_sets = [val_data]
             logger.info("Using separate validation set (%d rows) for early stopping.", len(X_val_clean))
         else:
-            valid_sets = [train_data]
             logger.warning(
-                "No validation set provided; early stopping will monitor training loss "
-                "(may overfit — provide X_val/y_val for best results)."
+                "No usable two-class validation set provided; training for the configured number of rounds."
             )
 
         num_rounds = int(train_params.get("n_estimators", 600))
-        callbacks = [lgb.early_stopping(stopping_rounds=40, verbose=True)]
+        if valid_sets:
+            callbacks = [lgb.early_stopping(stopping_rounds=40, verbose=True)]
+        if progress_callback is not None:
+            def report_progress(env: Any) -> None:
+                iteration = env.iteration + 1
+                if iteration == 1 or iteration % 10 == 0 or iteration == env.end_iteration:
+                    progress_callback(iteration, env.end_iteration)
+
+            report_progress.order = 20
+            callbacks.append(report_progress)
 
         self.model = lgb.train(
             train_params,
             train_data,
             num_boost_round=num_rounds,
-            valid_sets=valid_sets,
+            valid_sets=valid_sets or None,
             callbacks=callbacks,
         )
+        self.calibrator = None
 
         # Step 4 – SHAP explainer
         try:
@@ -242,11 +313,12 @@ class CSELightGBMModel:
             zip(
                 feature_cols,
                 self.model.feature_importance(importance_type="gain").tolist(),
+                strict=True,
             )
         )
         logger.info(
             "Training complete: best_iteration=%d, features=%d",
-            self.model.best_iteration,
+            self.model.best_iteration or num_rounds,
             len(feature_cols),
         )
         return {
@@ -256,6 +328,7 @@ class CSELightGBMModel:
             "scale_pos_weight": round(scale_pos_weight, 3),
             "train_pos": pos,
             "train_neg": neg,
+            "train_samples": len(y_train),
         }
 
     # ------------------------------------------------------------------
@@ -267,38 +340,79 @@ class CSELightGBMModel:
         X: pd.DataFrame,
         y: pd.Series,
         n_splits: int = 5,
+        dates: pd.Series | None = None,
     ) -> dict[str, Any]:
         """Walk-forward (time-series) cross-validation.
 
-        The dataset is split into ``n_splits`` expanding windows; the last 20%
-        of each window is the validation fold.  Returns mean/std AUC and
-        accuracy across folds — useful for hyper-parameter selection.
+        Splits are made by whole trading dates. Each outer validation window is
+        preceded by a 10-session purge; a separate earlier window is used for
+        early stopping so reported fold metrics are out-of-sample.
 
         Note: this trains a *temporary* model per fold and does **not** update
         ``self.model``.  Call ``train()`` separately on the full dataset after
         cross-validating.
         """
-        from sklearn.metrics import roc_auc_score, accuracy_score
+        from sklearn.metrics import accuracy_score, roc_auc_score
 
-        n = len(X)
-        fold_size = n // n_splits
+        if n_splits < 2:
+            raise ValueError("n_splits must be at least 2.")
+        if dates is None:
+            if "trading_date" in X.columns:
+                dates = X["trading_date"]
+            elif isinstance(X.index, pd.DatetimeIndex):
+                dates = pd.Series(X.index, index=X.index)
+            else:
+                raise ValueError("Trading dates must be supplied for leakage-safe cross-validation.")
+        if not dates.index.equals(X.index) or not X.index.equals(y.index):
+            raise ValueError("X, y, and dates must have matching indexes.")
+
+        horizon = 10
+        session_dates = pd.DatetimeIndex(pd.to_datetime(dates)).normalize().unique().sort_values()
+        if len(session_dates) <= n_splits * (horizon + 1):
+            raise ValueError("Insufficient trading dates for the requested purged folds.")
+        date_positions = {day: position for position, day in enumerate(session_dates)}
+        row_positions = pd.to_datetime(dates).dt.normalize().map(date_positions)
+        fold_size = len(session_dates) // (n_splits + 1)
         aucs, accs = [], []
 
         for fold in range(1, n_splits + 1):
-            end_idx = fold * fold_size
-            if end_idx < 50:
-                continue  # not enough data
-            split_idx = max(int(end_idx * 0.8), 20)
-            Xtr, ytr = X.iloc[:split_idx], y.iloc[:split_idx]
-            Xvl, yvl = X.iloc[split_idx:end_idx], y.iloc[split_idx:end_idx]
-            if len(yvl) < 10 or len(np.unique(yvl)) < 2:
+            outer_start = fold * fold_size
+            outer_end = min((fold + 1) * fold_size, len(session_dates))
+            outer_train_end = outer_start - horizon
+            inner_start = int(outer_train_end * 0.8)
+            inner_train_end = inner_start - horizon
+            if inner_train_end <= 0 or outer_end <= outer_start:
+                continue
+
+            train_mask = row_positions.lt(inner_train_end)
+            early_mask = row_positions.ge(inner_start) & row_positions.lt(outer_train_end)
+            fold_mask = row_positions.ge(outer_start) & row_positions.lt(outer_end)
+            history_mask = pd.Series(True, index=X.index)
+            for col in ("rsi_14", "volatility_20d"):
+                if col in X.columns:
+                    history_mask &= X[col].notna()
+            train_mask &= history_mask
+            early_mask &= history_mask
+            fold_mask &= history_mask
+            Xtr, ytr = X.loc[train_mask], y.loc[train_mask]
+            Xes, yes = X.loc[early_mask], y.loc[early_mask]
+            Xvl, yvl = X.loc[fold_mask], y.loc[fold_mask]
+            if (
+                len(ytr) < 50
+                or len(yes) < 10
+                or len(yvl) < 10
+                or ytr.nunique() < 2
+                or yes.nunique() < 2
+                or yvl.nunique() < 2
+            ):
                 continue
 
             tmp = CSELightGBMModel(params=self.params)
-            tmp.train(Xtr, ytr, Xvl, yvl)
+            tmp.train(Xtr, ytr, Xes, yes)
+            tmp.fit_calibrator(Xes, yes)
             probs = tmp.predict_proba(Xvl)
             auc = roc_auc_score(yvl, probs)
-            acc = accuracy_score(yvl, (probs >= 0.45).astype(int))
+            acc = accuracy_score(yvl, (probs >= 0.50).astype(int))
             aucs.append(auc)
             accs.append(acc)
             logger.info("CV fold %d/%d: AUC=%.4f Acc=%.4f", fold, n_splits, auc, acc)
@@ -315,29 +429,41 @@ class CSELightGBMModel:
     # Inference
     # ------------------------------------------------------------------
 
+    def _predict_raw(self, X: pd.DataFrame) -> np.ndarray:
+        if self.model is None:
+            raise ValueError("Model has not been trained or loaded yet.")
+        X_norm = self._normalise_features(X)
+        if hasattr(self.model, "feature_name") and callable(self.model.feature_name):
+            feature_cols = self.model.feature_name()
+        else:
+            feature_cols = [c for c in self.FEATURE_COLUMNS if c in X_norm.columns]
+        X_eval = (
+            X_norm.reindex(columns=feature_cols)
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+        )
+        return np.asarray(self.model.predict(X_eval), dtype=float)
+
+    def fit_calibrator(self, X_cal: pd.DataFrame, y_cal: pd.Series) -> None:
+        """Calibrate class-weighted model scores on a chronological validation window."""
+        if not X_cal.index.equals(y_cal.index):
+            raise ValueError("X_cal and y_cal must have matching indexes.")
+        if y_cal.nunique() < 2:
+            raise ValueError("Probability calibration requires both validation classes.")
+        raw_scores = self._predict_raw(X_cal)
+        self.calibrator = LogisticRegression(C=1.0, solver="lbfgs")
+        self.calibrator.fit(raw_scores.reshape(-1, 1), y_cal.astype(int))
+
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """Predict probabilities of beating the benchmark.
 
         Input ``X`` may contain raw price-level columns; they are normalised
         to ratios before inference, matching the training pipeline.
         """
-        if self.model is None:
-            raise ValueError("Model has not been trained or loaded yet.")
-
-        X_norm = self._normalise_features(X)
-
-        # Use the exact feature names the model was trained with
-        if hasattr(self.model, "feature_name") and callable(self.model.feature_name):
-            feature_cols = self.model.feature_name()
-        else:
-            feature_cols = [c for c in self.FEATURE_COLUMNS if c in X_norm.columns]
-
-        X_eval = (
-            X_norm.reindex(columns=feature_cols)
-            .apply(pd.to_numeric, errors="coerce")
-            .fillna(0.0)
-        )
-        return self.model.predict(X_eval)
+        raw_scores = self._predict_raw(X)
+        if self.calibrator is None:
+            return raw_scores
+        return self.calibrator.predict_proba(raw_scores.reshape(-1, 1))[:, 1]
 
     # ------------------------------------------------------------------
     # Explanation
@@ -366,7 +492,7 @@ class CSELightGBMModel:
                 else:
                     vals = shap_vals[0]
 
-                pairs = sorted(zip(feature_cols, vals), key=lambda x: abs(x[1]), reverse=True)
+                pairs = sorted(zip(feature_cols, vals, strict=True), key=lambda x: abs(x[1]), reverse=True)
                 return [{"feature": f, "impact": round(float(v), 4)} for f, v in pairs[:top_n]]
             except Exception as exc:
                 logger.debug("SHAP explanation failed: %s", exc)
@@ -374,7 +500,7 @@ class CSELightGBMModel:
         # Fallback to feature importance
         if self.model:
             imp = self.model.feature_importance(importance_type="gain")
-            pairs = sorted(zip(feature_cols, imp), key=lambda x: x[1], reverse=True)
+            pairs = sorted(zip(feature_cols, imp, strict=True), key=lambda x: x[1], reverse=True)
             return [{"feature": f, "impact": round(float(v), 2)} for f, v in pairs[:top_n]]
         return []
 
@@ -385,7 +511,10 @@ class CSELightGBMModel:
     def to_bytes(self) -> bytes:
         """Serialise model for database storage."""
         buf = io.BytesIO()
-        pickle.dump({"model": self.model, "params": self.params}, buf)
+        pickle.dump(
+            {"model": self.model, "params": self.params, "calibrator": self.calibrator},
+            buf,
+        )
         return buf.getvalue()
 
     @classmethod
@@ -394,6 +523,7 @@ class CSELightGBMModel:
         loaded = pickle.loads(data)
         instance = cls(params=loaded.get("params"))
         instance.model = loaded.get("model")
+        instance.calibrator = loaded.get("calibrator")
         try:
             if instance.model:
                 instance.explainer = shap.TreeExplainer(instance.model)

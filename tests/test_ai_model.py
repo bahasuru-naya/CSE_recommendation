@@ -15,7 +15,6 @@ import pytest
 
 from src.models.lgbm_model import CSELightGBMModel
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -83,9 +82,19 @@ def test_ai_model_training_and_output_bounds(sample_feature_data):
 
     # Use small n_estimators for speed; min_child_samples=5 to avoid leaf-size warnings
     model = CSELightGBMModel(params={"n_estimators": 50, "min_child_samples": 5})
-    train_res = model.train(X_train, y_train, X_val, y_val)
+    training_progress = []
+    train_res = model.train(
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        progress_callback=lambda iteration, total: training_progress.append((iteration, total)),
+    )
 
     assert train_res["status"] == "trained", "train() must return status=trained"
+    assert training_progress
+    assert training_progress[-1][1] == 50
+    assert train_res["train_samples"] == len(X_train)
     assert "feature_importance" in train_res
     assert isinstance(train_res["feature_importance"], dict)
     assert "scale_pos_weight" in train_res, "train() must report scale_pos_weight"
@@ -187,6 +196,7 @@ def test_ai_model_serialization(sample_feature_data):
     X, y = sample_feature_data
     model = CSELightGBMModel(params={"n_estimators": 30, "min_child_samples": 5})
     model.train(X, y)
+    model.fit_calibrator(X, y)
 
     orig_preds = model.predict_proba(X.iloc[:10])
 
@@ -222,6 +232,15 @@ def test_ai_target_creation_with_hurdle_rate():
     assert target.iloc[2] == 1, f"Expected 1 got {target.iloc[2]}"
     # Row 1 (100→100 in 1 day): 0% < hurdle → 0
     assert target.iloc[1] == 0, f"Expected 0 got {target.iloc[1]}"
+    assert np.isnan(target.iloc[-1])
+
+
+def test_feature_normalization_prefers_adjusted_price_over_raw_close():
+    X = pd.DataFrame({"close": [50.0], "price": [100.0], "sma_5": [110.0]})
+
+    normalized = CSELightGBMModel._normalise_features(X)
+
+    assert normalized.loc[0, "sma_5_ratio"] == pytest.approx(0.1)
 
 
 def test_ai_model_class_imbalance_handling():
@@ -243,3 +262,11 @@ def test_ai_model_class_imbalance_handling():
         f"scale_pos_weight={spw:.2f} but expected ≈{expected_spw:.2f} "
         f"(pos={pos}, neg={neg})"
     )
+
+
+def test_cross_validation_requires_trading_dates(sample_feature_data):
+    X, y = sample_feature_data
+    model = CSELightGBMModel()
+
+    with pytest.raises(ValueError, match="Trading dates must be supplied"):
+        model.cross_validate(X, y, n_splits=2)

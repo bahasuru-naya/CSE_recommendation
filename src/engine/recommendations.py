@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
 import json
 import logging
+import math
+from datetime import date, datetime, timedelta
+from numbers import Integral, Real
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 class RecommendationManager:
@@ -46,19 +63,6 @@ class RecommendationManager:
         latest_date = max(r.get("recommendation_date") or date.today() for r in deduped)
         symbols = list(unique_recs.keys())
 
-        # 3. Clean up: remove all old predictions from previous dates
-        self.session.execute(
-            text("DELETE FROM app.recommendations WHERE recommendation_date < :latest_date"),
-            {"latest_date": latest_date},
-        )
-
-        # 4. Remove any existing predictions for these symbols to avoid duplicates
-        self.session.execute(
-            text("DELETE FROM app.recommendations WHERE UPPER(symbol) = ANY(:symbols)"),
-            {"symbols": symbols},
-        )
-        self.session.commit()
-
         insert_q = text("""
             INSERT INTO app.recommendations (
                 security_id, symbol, security_name, recommendation_date,
@@ -75,36 +79,50 @@ class RecommendationManager:
             )
         """)
 
-        saved = 0
+        insert_params = []
         for r in deduped:
-            try:
-                params = {
-                    "security_id": r["security_id"],
-                    "symbol": r["symbol"],
-                    "security_name": r.get("security_name", r["symbol"]),
-                    "recommendation_date": r.get("recommendation_date", date.today()),
-                    "signal": r["signal"],
-                    "confidence": r.get("confidence", 0.5),
-                    "entry_price_low": r.get("entry_price_low"),
-                    "entry_price_high": r.get("entry_price_high"),
-                    "stop_loss": r.get("stop_loss"),
-                    "target_price": r.get("target_price"),
-                    "position_size_pct": r.get("position_size_pct", 0.05),
-                    "max_quantity": r.get("max_quantity", 100),
-                    "horizon_days": r.get("horizon_days", 10),
-                    "reasons": json.dumps(r.get("reasons", []), default=str),
-                    "model_version": r.get("model_version", "v1.0"),
-                    "data_freshness": json.dumps(r.get("data_freshness", {}), default=str),
-                    "logo_url": r.get("logo_url"),
-                    "expires_at": datetime.utcnow() + timedelta(days=r.get("horizon_days", 10)),
-                }
-                self.session.execute(insert_q, params)
-                saved += 1
-            except Exception as e:
-                logger.error("Failed saving recommendation for %s: %s", r.get("symbol"), e)
+            horizon_days = r.get("horizon_days", 10)
+            insert_params.append({
+                "security_id": r["security_id"],
+                "symbol": r["symbol"],
+                "security_name": r.get("security_name", r["symbol"]),
+                "recommendation_date": r.get("recommendation_date", date.today()),
+                "signal": r["signal"],
+                "confidence": r.get("confidence", 0.5),
+                "entry_price_low": r.get("entry_price_low"),
+                "entry_price_high": r.get("entry_price_high"),
+                "stop_loss": r.get("stop_loss"),
+                "target_price": r.get("target_price"),
+                "position_size_pct": r.get("position_size_pct", 0.05),
+                "max_quantity": r.get("max_quantity", 100),
+                "horizon_days": horizon_days,
+                "reasons": json.dumps(_json_safe(r.get("reasons", [])), default=str, allow_nan=False),
+                "model_version": r.get("model_version", "v1.0"),
+                "data_freshness": json.dumps(_json_safe(r.get("data_freshness", {})), default=str, allow_nan=False),
+                "logo_url": r.get("logo_url"),
+                "expires_at": datetime.utcnow() + timedelta(days=horizon_days),
+            })
 
-        self.session.commit()
-        return saved
+        # Keep deletion and insertion atomic so a failed refresh preserves prior recommendations.
+        current_symbol = None
+        try:
+            self.session.execute(
+                text("DELETE FROM app.recommendations WHERE recommendation_date < :latest_date"),
+                {"latest_date": latest_date},
+            )
+            self.session.execute(
+                text("DELETE FROM app.recommendations WHERE UPPER(symbol) = ANY(:symbols)"),
+                {"symbols": symbols},
+            )
+            for params in insert_params:
+                current_symbol = params["symbol"]
+                self.session.execute(insert_q, params)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            logger.exception("Failed saving recommendations%s", f" for {current_symbol}" if current_symbol else "")
+            raise
+        return len(insert_params)
 
     def get_active(self, signal_filter: str | None = None) -> list[dict[str, Any]]:
         """Retrieve all currently active recommendations."""

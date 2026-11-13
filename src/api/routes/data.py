@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
 import io
 import logging
 import os
+import threading
+from datetime import UTC, datetime
+from typing import Any
+
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import text
@@ -13,7 +16,6 @@ from sqlalchemy.orm import Session
 
 from src.core.reconciliation import DataReconciler
 from src.db import get_db
-from src.ingestion.orchestrator import IngestionOrchestrator
 from src.scheduler.jobs import PipelineScheduler
 
 logger = logging.getLogger(__name__)
@@ -369,7 +371,15 @@ def get_anomalies(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 # In-memory job state (simple for local use)
-_download_jobs: dict = {}  # job_id -> {status, progress, total, message, started_at}
+_download_jobs: dict[str, dict[str, Any]] = {}
+_download_jobs_lock = threading.Lock()
+
+
+def _update_download_job(job_id: str, **updates: Any) -> None:
+    with _download_jobs_lock:
+        job = _download_jobs.get(job_id)
+        if job is not None:
+            job.update(updates)
 
 
 @router.post("/download")
@@ -386,28 +396,43 @@ def trigger_download(
     supported historical range from the official CSE API.
     """
     import uuid
-    from datetime import datetime
     job_id = str(uuid.uuid4())[:8]
-    _download_jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "progress": 0,
-        "total": 0,
-        "message": "Queued...",
-        "started_at": datetime.utcnow().isoformat(),
-        "finished_at": None,
-        "error": None,
-    }
+    with _download_jobs_lock:
+        _download_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "total": 0,
+            "processed": 0,
+            "symbols_succeeded": 0,
+            "symbols_failed": 0,
+            "rows_downloaded": 0,
+            "warnings": [],
+            "warnings_count": 0,
+            "message": "Queued...",
+            "started_at": datetime.now(UTC).isoformat(),
+            "finished_at": None,
+            "error": None,
+        }
 
     def run_download():
-        from src.db import SessionLocal
-        from src.ingestion.orchestrator import IngestionOrchestrator
-        from src.core.price_daily import DailyPriceBuilder
-        from src.features.builder import FeatureBuilder
-        session = SessionLocal()
+        session: Session | None = None
+        orch = None
         try:
-            _download_jobs[job_id]["status"] = "running"
-            _download_jobs[job_id]["message"] = "Downloading price history..."
+            from src.core.price_daily import DailyPriceBuilder
+            from src.db import SessionLocal
+            from src.features.builder import FeatureBuilder
+            from src.ingestion.orchestrator import IngestionOrchestrator
+
+            session = SessionLocal()
+            _update_download_job(
+                job_id,
+                status="running",
+                stage="market-data",
+                progress=2,
+                message="Downloading current market summary and indices...",
+            )
 
             orch = IngestionOrchestrator(session)
             orch.trade_summary.sync()
@@ -417,26 +442,123 @@ def trigger_download(
             price_builder.process_staging_trade_summary()
             price_builder.process_indices()
 
-            _download_jobs[job_id]["message"] = f"Backfilling period {period} (up to 1 Year)..."
+            _update_download_job(
+                job_id,
+                stage="history",
+                progress=10,
+                message=f"Fetching historical chart data for period {period}...",
+            )
             symbols_list = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else None
-            orch.backfill_history(symbols=symbols_list, period=period, limit=limit)
+
+            def on_symbol_progress(
+                processed: int,
+                total: int,
+                symbol: str,
+                points: int,
+                error: str | None,
+            ) -> None:
+                progress = 10 + round(60 * processed / total) if total else 70
+                with _download_jobs_lock:
+                    job = _download_jobs[job_id]
+                    warnings = job["warnings"]
+                    if error:
+                        job["warnings_count"] += 1
+                        if len(warnings) < 8:
+                            warnings.append({"symbol": symbol, "error": error})
+                    job.update({
+                        "stage": "history",
+                        "progress": min(progress, 70),
+                        "processed": processed,
+                        "total": total,
+                        "symbols_succeeded": job["symbols_succeeded"] + int(points > 0),
+                        "symbols_failed": job["symbols_failed"] + int(points == 0),
+                        "rows_downloaded": job["rows_downloaded"] + points,
+                        "current_symbol": symbol,
+                        "message": f"Chart history: {processed}/{total} symbols processed ({symbol})",
+                    })
+
+            download_result = orch.backfill_history(
+                symbols=symbols_list,
+                period=period,
+                limit=limit,
+                progress_callback=on_symbol_progress,
+            )
+            if (
+                download_result["symbols_processed"] > 0
+                and download_result["symbols_succeeded"] == 0
+            ):
+                details = "; ".join(
+                    f"{failure['symbol']}: {failure['error']}"
+                    for failure in download_result["failed_symbols"][:3]
+                )
+                raise RuntimeError(f"No chart history was downloaded. {details}")
+
+            _update_download_job(
+                job_id,
+                stage="processing",
+                progress=72,
+                message="Applying chart data to daily prices...",
+            )
             price_builder.process_staging_chart_data()
 
             if run_features:
-                _download_jobs[job_id]["message"] = "Computing historical features..."
-                feat_builder = FeatureBuilder(session)
-                saved = feat_builder.build_all_features_historical()
-                _download_jobs[job_id]["message"] = f"Features computed: {saved} rows"
+                successful_symbols = download_result["successful_symbols"]
+                security_ids = []
+                if successful_symbols:
+                    security_ids = session.execute(
+                        text("""
+                            SELECT security_id
+                            FROM core.dim_security
+                            WHERE is_active = TRUE AND symbol = ANY(:symbols)
+                        """),
+                        {"symbols": successful_symbols},
+                    ).scalars().all()
 
-            _download_jobs[job_id]["status"] = "completed"
-            _download_jobs[job_id]["progress"] = 100
-            from datetime import datetime
-            _download_jobs[job_id]["finished_at"] = datetime.utcnow().isoformat()
+                feat_builder = FeatureBuilder(session)
+
+                def on_feature_progress(processed: int, total: int, rows_saved: int) -> None:
+                    progress = 80 + round(19 * processed / total) if total else 99
+                    _update_download_job(
+                        job_id,
+                        stage="features",
+                        progress=min(progress, 99),
+                        processed_securities=processed,
+                        total_securities=total,
+                        message=f"Computing features: {processed}/{total} securities ({rows_saved} rows saved)",
+                    )
+
+                saved = feat_builder.build_all_features_historical(
+                    security_ids=list(security_ids),
+                    progress_callback=on_feature_progress,
+                )
+                final_message = f"Download complete: {download_result['symbols_succeeded']}/{download_result['symbols_processed']} symbols, {download_result['total_points']} chart rows, {saved} feature rows."
+            else:
+                final_message = f"Download complete: {download_result['symbols_succeeded']}/{download_result['symbols_processed']} symbols, {download_result['total_points']} chart rows."
+
+            with _download_jobs_lock:
+                job = _download_jobs[job_id]
+                status = "partial" if job["symbols_failed"] else "completed"
+                job.update(
+                    status=status,
+                    stage="completed",
+                    progress=100,
+                    message=final_message,
+                    finished_at=datetime.now(UTC).isoformat(),
+                )
         except Exception as e:
-            _download_jobs[job_id]["status"] = "failed"
-            _download_jobs[job_id]["error"] = str(e)
+            _update_download_job(
+                job_id,
+                status="failed",
+                stage="failed",
+                error=str(e),
+                message="Download failed.",
+                finished_at=datetime.now(UTC).isoformat(),
+            )
         finally:
-            session.close()
+            if orch is not None:
+                orch.client.close()
+            if session is not None:
+                session.close()
 
     background_tasks.add_task(run_download)
     return {"job_id": job_id, "status": "queued", "message": "Download job started"}
@@ -670,13 +792,15 @@ async def import_csv_history(
 @router.get("/download/status")
 def get_download_status():
     """Get status of all download jobs."""
-    return list(_download_jobs.values())
+    with _download_jobs_lock:
+        return [job.copy() for job in _download_jobs.values()]
 
 
 @router.get("/download/status/{job_id}")
 def get_download_job(job_id: str):
     """Get status of a specific download job."""
-    job = _download_jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return job
+    with _download_jobs_lock:
+        job = _download_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        return job.copy()

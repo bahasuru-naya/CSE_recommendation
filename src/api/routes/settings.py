@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.alerts.telegram import TelegramAlerter
+from src.config import get_settings
 from src.db import get_db
 
 router = APIRouter()
@@ -18,10 +21,23 @@ class SettingUpdate(BaseModel):
     value: dict[str, Any]
 
 
+class TelegramSettingsUpdate(BaseModel):
+    bot_token: str | None = None
+    chat_id: str = ""
+    alert_time: str | None = None
+
+    @field_validator("alert_time")
+    @classmethod
+    def validate_alert_time(cls, value: str | None) -> str | None:
+        if value is not None:
+            datetime.strptime(value, "%H:%M")
+        return value
+
+
 @router.get("/")
 def get_all_settings(db: Session = Depends(get_db)):
     """Retrieve all configuration keys and values from app.settings."""
-    query = text("SELECT key, value, description, updated_at FROM app.settings")
+    query = text("SELECT key, value, description, updated_at FROM app.settings WHERE key != 'telegram'")
     rows = db.execute(query).fetchall()
     return {
         r[0]: {
@@ -31,6 +47,75 @@ def get_all_settings(db: Session = Depends(get_db)):
         }
         for r in rows
     }
+
+
+@router.get("/telegram")
+def get_telegram_settings(db: Session = Depends(get_db)):
+    """Return Telegram configuration without disclosing the bot token."""
+    stored = db.execute(
+        text("SELECT value FROM app.settings WHERE key = 'telegram'")
+    ).scalar()
+    value = stored if isinstance(stored, dict) else {}
+    config = get_settings()
+    bot_token = value.get("bot_token") or config.telegram_bot_token
+    return {
+        "bot_token_configured": bool(bot_token),
+        "chat_id": value.get("chat_id") or config.telegram_chat_id,
+        "alert_time": value.get("alert_time", "15:00"),
+    }
+
+
+@router.put("/telegram")
+def update_telegram_settings(
+    payload: TelegramSettingsUpdate,
+    db: Session = Depends(get_db),
+):
+    """Save Telegram settings while retaining the token when its field is blank."""
+    current = db.execute(
+        text("SELECT value FROM app.settings WHERE key = 'telegram'")
+    ).scalar()
+    current_value = current if isinstance(current, dict) else {}
+    bot_token = (payload.bot_token or "").strip() or current_value.get("bot_token", "")
+    token_configured = bool(bot_token or get_settings().telegram_bot_token)
+    alert_time = payload.alert_time or current_value.get("alert_time", "15:00")
+    value = {
+        **current_value,
+        "bot_token": bot_token,
+        "chat_id": payload.chat_id.strip(),
+        "alert_time": alert_time,
+    }
+    db.execute(
+        text("""
+            INSERT INTO app.settings (key, value, description, updated_at)
+            VALUES ('telegram', CAST(:value AS JSONB), 'Telegram alert settings', NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+        """),
+        {"value": json.dumps(value)},
+    )
+    db.commit()
+    return {
+        "status": "updated",
+        "bot_token_configured": token_configured,
+        "chat_id": value["chat_id"],
+        "alert_time": alert_time,
+    }
+
+
+@router.post("/telegram/test")
+def send_telegram_test(payload: TelegramSettingsUpdate, db: Session = Depends(get_db)):
+    """Send a one-off test alert using saved or currently entered credentials."""
+    alerter = TelegramAlerter(
+        bot_token=payload.bot_token or None,
+        chat_id=payload.chat_id or None,
+        db=db,
+    )
+    if not alerter.bot_token or not alerter.chat_id:
+        raise HTTPException(status_code=400, detail="Configure a bot token and chat ID first.")
+    if not alerter.send_message("CSE Recommendation: Telegram test alert sent successfully."):
+        raise HTTPException(status_code=502, detail="Telegram rejected the test alert. Check the bot token and chat ID.")
+    return {"status": "sent"}
 
 
 @router.put("/{key}")

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date
 import logging
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -48,6 +48,7 @@ class DecisionEngine:
                 s.name,
                 s.logo_url,
                 p.close AS current_price,
+                COALESCE(NULLIF(p.adj_close, 0), p.close) AS model_price,
                 f.*
             FROM core.dim_security s
             JOIN core.fact_price_daily p
@@ -65,7 +66,8 @@ class DecisionEngine:
 
         # 1. Kill switch
         if self.check_kill_switch():
-            return [{"warning": "Recommendations aborted: data is stale."}]
+            logger.warning("Kill switch fired — returning empty recommendations list.")
+            return []
 
         # 2. Check regime
         aspi_row = self.session.execute(
@@ -80,10 +82,10 @@ class DecisionEngine:
 
         regime_info = {"regime": "BULLISH", "allow_buy": True, "position_scale": 1.0}
         if aspi_row and len(aspi_row) >= 10:
-            prices = [float(r[0]) for r in aspi_row]
-            curr_aspi = prices[0]
-            sma_100 = sum(prices) / len(prices)
-            regime_info = self.regime_filter.classify(curr_aspi, sma_100, 0.18)
+            # Prices from DB are ordered DESC (most-recent first); reverse to oldest-first for vol/SMA.
+            prices_desc = [float(r[0]) for r in aspi_row]
+            prices_asc = list(reversed(prices_desc))
+            regime_info = self.regime_filter.classify_from_prices(prices_asc)
 
         # 3. Load active model
         active_model_data = self.registry.get_active_model()
@@ -109,65 +111,96 @@ class DecisionEngine:
             sec_id = int(row["security_id"])
             symbol = str(row["symbol"])
             name = str(row["name"] or symbol)
-            current_p = float(row["current_price"]) if row["current_price"] else None
-            if not current_p or current_p <= 0:
+            current_value = row.get("current_price")
+            current_p = (
+                float(current_value)
+                if current_value is not None and pd.notna(current_value)
+                else None
+            )
+            if current_p is None or current_p <= 0:
                 continue
+
+            row = row.copy()
+            if "close" not in row or pd.isna(row.get("close")):
+                row["close"] = current_p
+            model_price = row.get("model_price")
+            model_price = (
+                float(model_price)
+                if model_price is not None and pd.notna(model_price) and float(model_price) > 0
+                else current_p
+            )
+            row["price"] = model_price
 
             # Liquidity check
             avg_turnover = float(row.get("avg_daily_turnover_20d") or 0.0)
             avg_vol = float(row.get("avg_daily_volume_20d") or 0.0)
             is_liquid = avg_turnover >= min_turnover_20d and avg_vol >= min_volume_20d
+            has_sufficient_history = all(
+                pd.notna(row.get(col)) for col in ("rsi_14", "volatility_20d")
+            )
+            watch_reason = None
 
             # Model prediction or heuristic rule
-            predicted_prob = 0.5
+            predicted_prob: float | None = None
             raw_shap = []
 
             if model_instance is not None:
-                prob = model_instance.predict_proba(pd.DataFrame([row]))[0]
-                predicted_prob = float(prob)
-                raw_shap = model_instance.explain(pd.DataFrame([row]), top_n=5)
+                if has_sufficient_history:
+                    row_dict = row.to_dict()
+                    prob = model_instance.predict_proba(pd.DataFrame([row_dict]))[0]
+                    predicted_prob = float(prob)
+                    raw_shap = model_instance.explain(pd.DataFrame([row_dict]), top_n=5)
+                else:
+                    logger.info("Skipping prediction for %s: insufficient feature history.", symbol)
+                    watch_reason = "Insufficient price history to calculate reliable model features."
+                signal = "WATCH"
             else:
-                # Heuristic scoring using momentum and RSI
-                rsi = float(row.get("rsi_14") or 50)
-                ret_20d = float(row.get("return_20d") or 0.0)
-                if rsi < 65 and ret_20d > 0.03:
-                    predicted_prob = 0.72
-                    raw_shap = [
-                        {"feature": "return_20d", "impact": round(ret_20d, 4)},
-                        {"feature": "rsi_14", "impact": round(rsi, 1)},
-                    ]
-                elif rsi > 75 or ret_20d < -0.05:
-                    predicted_prob = 0.25
+                predicted_prob = None
+                signal = "WATCH"
+                watch_reason = "No trained model available. Keeping on watchlist until a model is trained."
 
-            # ATR for stops and targets
-            atr = float(row.get("atr_14") or (current_p * 0.03))
-            stop_loss = max(round(current_p - (atr * 2.0), 2), 0.05)
-            target_p = max(round(current_p + (atr * 3.0), 2), round(current_p * 1.01, 2))
+            # ATR for stops and targets — explicit NaN guard (pd.isna catches float('nan'))
+            _atr_raw = row.get("atr_14")
+            adjustment_factor = model_price / current_p
+            atr = (
+                float(_atr_raw) / adjustment_factor
+                if _atr_raw is not None and pd.notna(_atr_raw) and float(_atr_raw) > 0 and adjustment_factor > 0
+                else current_p * 0.03
+            )
+            _stop_raw = max(round(current_p - (atr * 2.0), 2), 0.05)
+            stop_loss = _stop_raw if not pd.isna(_stop_raw) else max(current_p - atr * 2.0, 0.05)
+            _tgt_raw = round(current_p + (atr * 3.0), 2)
+            target_p = _tgt_raw if not pd.isna(_tgt_raw) else round(current_p + atr * 3.0, 2)
+            target_p = max(target_p, round(current_p * 1.01, 2))
             entry_low = round(current_p * 0.99, 2)
             entry_high = round(current_p * 1.01, 2)
 
-            # Signal assignment
-            if not is_liquid:
+            # Signal assignment (only when model is available; else branch already set WATCH)
+            if model_instance is not None and has_sufficient_history and predicted_prob is not None:
+                if not is_liquid:
+                    signal = "WATCH"
+                elif predicted_prob >= 0.65 and regime_info["allow_buy"]:
+                    signal = "BUY"
+                elif predicted_prob <= 0.35:
+                    signal = "SELL"
+                else:
+                    signal = "HOLD"
+            elif not is_liquid:
+                # Even in WATCH-by-no-model mode, liquidity check still applies (same outcome).
                 signal = "WATCH"
-            elif predicted_prob >= 0.65 and regime_info["allow_buy"]:
-                signal = "BUY"
-            elif predicted_prob <= 0.35:
-                signal = "SELL"
-            else:
-                signal = "HOLD"
 
             # Sizing
             sizing = self.position_sizer.size(
                 entry_price=current_p,
                 stop_loss=stop_loss,
                 avg_daily_volume=avg_vol,
-                confidence=predicted_prob,
+                confidence=predicted_prob if predicted_prob is not None else 0.0,
             )
 
             # Build rich feature explainability factors (beginner-friendly descriptions)
             def _format_feat_val(f_name: str, r_dict: dict) -> str:
                 v = r_dict.get(f_name)
-                if v is None:
+                if v is None or pd.isna(v):
                     return "-"
                 try:
                     val_f = float(v)
@@ -241,8 +274,11 @@ class DecisionEngine:
             if raw_shap:
                 for item in raw_shap:
                     feat = item.get("feature", "")
-                    imp = float(item.get("impact") or 0.0)
-                    meta = feature_meta.get(feat, (feat.replace("_", " ").title(), str(round(float(row.get(feat) or 0), 2)), "Model alpha indicator"))
+                    raw_impact = item.get("impact")
+                    imp = float(raw_impact) if raw_impact is not None and pd.notna(raw_impact) else 0.0
+                    raw_value = row.get(feat)
+                    display_value = float(raw_value) if raw_value is not None and pd.notna(raw_value) else 0.0
+                    meta = feature_meta.get(feat, (feat.replace("_", " ").title(), str(round(display_value, 2)), "Model alpha indicator"))
                     factors.append({
                         "feature": feat,
                         "display_name": meta[0],
@@ -254,9 +290,9 @@ class DecisionEngine:
             else:
                 # Default factor breakdown from calculated features
                 candidate_feats = ["return_5d", "return_20d", "rsi_14", "volume_ratio", "rs_vs_aspi_20d"]
-                chosen = [f for f in candidate_feats if row.get(f) is not None or f in feature_meta][:4]
+                chosen = [f for f in candidate_feats if pd.notna(row.get(f))][:4]
                 for feat in chosen:
-                    val = float(row.get(feat) or 0.0)
+                    val = float(row.get(feat))
                     meta = feature_meta.get(feat, (feat.replace("_", " ").title(), str(round(val, 2)), "Indicator"))
                     factors.append({
                         "feature": feat,
@@ -273,25 +309,34 @@ class DecisionEngine:
             rr_ratio = round((target_p - current_p) / max(current_p - stop_loss, 0.01), 2)
 
             if signal == "BUY":
+                hurdle_pct = 2.68
+                expected_return_pct = upside_pct
                 summary = (
                     f"Good buying opportunity with {int(predicted_prob * 100)}% model confidence. "
-                    f"Strong technical momentum in a {regime_info['regime']} market regime, with expected upside easily clearing the 2.68% CSE brokerage fee hurdle. "
+                    f"Strong technical momentum in a {regime_info['regime']} market regime. "
+                    f"Expected return {expected_return_pct:.1f}% vs {hurdle_pct:.1f}% hurdle. "
                     f"Offers a {rr_ratio}:1 reward-to-risk ratio with {upside_pct}% target profit goal vs {downside_pct}% safety stop-loss buffer."
                 )
             elif signal == "SELL":
+                _sell_conf = int((1 - predicted_prob) * 100) if predicted_prob is not None else "N/A"
                 summary = (
-                    f"Time to take profit or protect savings ({int((1 - predicted_prob) * 100)}% risk score). "
+                    f"Time to take profit or protect savings ({_sell_conf}% risk score). "
                     f"Defensive exit signal triggered to avoid potential short-term price drops."
                 )
             elif signal == "WATCH":
-                summary = (
-                    f"Keep on watchlist. Daily trading turnover (LKR {round(avg_turnover):,}) "
-                    f"is currently below the safe LKR {round(min_turnover_20d):,} threshold needed to buy and sell without delays."
-                )
+                if watch_reason is not None:
+                    summary = watch_reason
+                else:
+                    summary = (
+                        f"Keep on watchlist. Daily trading turnover (LKR {round(avg_turnover):,}) "
+                        f"is currently below the safe LKR {round(min_turnover_20d):,} threshold needed to buy and sell without delays."
+                    )
             else:
+                _hold_conf = int(predicted_prob * 100) if predicted_prob is not None else "N/A"
+                hurdle_pct = 2.68
                 summary = (
-                    f"Neutral holding zone ({int(predicted_prob * 100)}% confidence). Projected return is not high enough yet "
-                    f"to comfortably beat the 2.68% CSE broker fee and tax hurdle."
+                    f"Neutral holding zone ({_hold_conf}% confidence). Projected return {upside_pct:.1f}% is not high enough yet "
+                    f"to comfortably beat the {hurdle_pct:.2f}% CSE broker fee and tax hurdle."
                 )
 
             explainability_payload = {
@@ -323,7 +368,7 @@ class DecisionEngine:
                 },
                 "model_details": {
                     "model_version": model_version,
-                    "confidence": round(predicted_prob, 3),
+                    "confidence": round(predicted_prob, 3) if predicted_prob is not None else None,
                     "hurdle_rate": "2.68% (CSE Commission + SEC/CSE Levies Buy & Sell)",
                     "horizon_days": 10,
                 },
@@ -336,7 +381,7 @@ class DecisionEngine:
                 "logo_url": str(row["logo_url"]) if ("logo_url" in row and row["logo_url"] and pd.notna(row["logo_url"])) else None,
                 "recommendation_date": t_date,
                 "signal": signal,
-                "confidence": round(predicted_prob, 3),
+                "confidence": round(predicted_prob, 3) if predicted_prob is not None else None,
                 "entry_price_low": entry_low,
                 "entry_price_high": entry_high,
                 "stop_loss": stop_loss,
@@ -350,9 +395,11 @@ class DecisionEngine:
             }
             decisions.append(rec)
 
-        # Sort recommendations: BUYs first with highest confidence
-        decisions.sort(key=lambda x: (x["signal"] == "BUY", x["confidence"]), reverse=True)
+        # Sort recommendations: BUYs first with highest confidence (None confidence sorts last)
+        decisions.sort(key=lambda x: (x["signal"] == "BUY", x["confidence"] if x["confidence"] is not None else -1.0), reverse=True)
         # Save to database
-        self.rec_manager.save_recommendations(decisions)
-        logger.info("Generated and saved %d recommendations for %s", len(decisions), t_date)
+        saved = self.rec_manager.save_recommendations(decisions)
+        if saved != len(decisions):
+            raise RuntimeError(f"Only {saved} of {len(decisions)} recommendations were persisted.")
+        logger.info("Generated and saved %d recommendations for %s", saved, t_date)
         return decisions

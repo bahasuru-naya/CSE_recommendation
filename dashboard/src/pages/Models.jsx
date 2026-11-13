@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   useModels,
   usePromoteModel,
   useRetrainModel,
+  useRetrainStatus,
   useGeneratePredictions,
   useModelPerformance,
 } from '../api/client';
@@ -32,37 +34,42 @@ import InfoTooltip from '../components/InfoTooltip';
 import { useBeginnerMode } from '../components/BeginnerModeContext';
 import { getFeatureMeta } from '../data/featureMetadata';
 
-const DEFAULT_FEATURES = [
-  { feat: 'return_20d', name: '20-day momentum return', score: 54.5 },
-  { feat: 'return_10d', name: '10-day momentum return', score: 27.2 },
-  { feat: 'volume_ratio', name: 'Volume to 20-day average ratio', score: 14.8 },
-  { feat: 'macd_signal', name: 'MACD signal line crossover', score: 2.5 },
-  { feat: 'macd', name: 'MACD momentum indicator', score: 1.1 },
-  { feat: 'rsi_14', name: '14-day Relative Strength Index', score: 0.8 },
-];
-
 export default function Models() {
   const { isBeginnerMode } = useBeginnerMode();
   const { data: models = [], isLoading: modelsLoading, refetch: refetchModels } = useModels();
   const { data: perfSummary, refetch: refetchPerf } = useModelPerformance();
   const promoteMutation = usePromoteModel();
   const retrainMutation = useRetrainModel();
+  const queryClient = useQueryClient();
+  const [retrainJobId, setRetrainJobId] = useState(null);
+  const { data: retrainStatus, error: retrainStatusError } = useRetrainStatus(retrainJobId);
   const predictMutation = useGeneratePredictions();
 
   const [notification, setNotification] = useState(null);
 
-  const activeModel = models.find((m) => m.is_active) || models[0];
+  const activeModel = models.find((m) => m.is_active);
   const activeMetrics = activeModel?.metrics || {};
 
-  // Extract performance metrics with fallbacks
-  const sharpe = activeMetrics.sharpe_ratio ?? 1.48;
-  const winRate = activeMetrics.win_rate ?? 62.5;
-  const maxDd = activeMetrics.max_drawdown ?? -8.4;
-  const excessRet = activeMetrics.excess_return ?? 11.2;
-  const accuracy = activeMetrics.accuracy ?? 93.1;
-  const valAuc = activeMetrics.val_auc ?? 0.85;
-  const trainSamples = activeMetrics.train_samples ?? 1038;
-  const bestIter = activeMetrics.best_iteration ?? 6;
+  const sharpe = activeMetrics.sharpe_ratio;
+  const winRate = activeMetrics.win_rate;
+  const excessRet = activeMetrics.excess_return;
+  const accuracy = activeMetrics.accuracy;
+  const valAuc = activeMetrics.val_auc;
+  const trainSamples = activeMetrics.train_samples;
+  const bestIter = activeMetrics.best_iteration;
+  const noHoldoutTrades = Number(activeMetrics.total_trades) === 0;
+  const formatMetric = (value, digits = 2) => {
+    const numeric = Number(value);
+    return value == null || !Number.isFinite(numeric) ? '—' : numeric.toFixed(digits);
+  };
+  const hasGateMetrics = [activeMetrics.val_auc, activeMetrics.sharpe_ratio, activeMetrics.excess_return, activeMetrics.total_trades]
+    .every((value) => value != null && Number.isFinite(Number(value)));
+  const safetyGatePassed =
+    hasGateMetrics &&
+    Number(activeMetrics.val_auc) > 0.5 &&
+    Number(activeMetrics.sharpe_ratio) >= 1 &&
+    Number(activeMetrics.excess_return) > 0 &&
+    Number(activeMetrics.total_trades) > 0;
 
   // Features list enriched with beginner-friendly metadata
   const featuresList =
@@ -76,23 +83,72 @@ export default function Models() {
             meta,
           };
         })
-      : DEFAULT_FEATURES.map((f) => {
-          const meta = getFeatureMeta(f.feat);
-          return {
-            ...f,
-            name: meta.name,
-            meta,
-          };
+      : [];
+
+  useEffect(() => {
+    if (retrainStatusError && retrainJobId && !retrainStatus) {
+      if (retrainStatusError.response?.status === 404) {
+        setNotification({
+          type: 'error',
+          title: 'Training Status Lost',
+          message: 'The API no longer has this training job. It may have restarted; start a new training run to continue.',
         });
+        setRetrainJobId(null);
+        return;
+      }
+      setNotification({
+        type: 'info',
+        message: `Training continues, but progress could not be refreshed: ${retrainStatusError.message}`,
+      });
+      return;
+    }
+    if (!retrainStatus) return;
+    if (retrainStatus.status === 'completed') {
+      const result = retrainStatus.result;
+      const predictionUpdate = result?.prediction_update;
+      const predictionsFailed = predictionUpdate?.status === 'failed';
+      setNotification({
+        type: predictionsFailed ? 'error' : 'success',
+        title: predictionsFailed ? 'Model Active; Predictions Not Updated' : 'Model Retraining Completed',
+        message: result?.message || retrainStatus.message,
+        stats: result?.metrics,
+      });
+      setRetrainJobId(null);
+      refetchModels();
+      refetchPerf();
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['recommendations'] }),
+        queryClient.invalidateQueries({ queryKey: ['recommendations-history'] }),
+      ]);
+    } else if (retrainStatus.status === 'failed') {
+      const error = retrainStatus.error;
+      setNotification({
+        type: 'error',
+        title: 'Retraining Failed',
+        message: `${error?.type ? `${error.type}: ` : ''}${error?.message || retrainStatus.message || 'An error occurred during model retraining.'}`,
+      });
+      setRetrainJobId(null);
+    } else if (retrainJobId) {
+      setNotification({
+        type: 'info',
+        message: retrainStatus.message || 'Model training is running.',
+      });
+    }
+  }, [retrainStatus, retrainStatusError, retrainJobId, refetchModels, refetchPerf, queryClient]);
 
   const handleRetrain = async () => {
     try {
-      setNotification({ type: 'info', message: 'Retraining LightGBM model and updating predictions...' });
-      const res = await retrainMutation.mutateAsync({ updatePredictions: true, asyncMode: false });
+      setNotification({ type: 'info', message: 'Queuing model training using existing stored data...' });
+      const res = await retrainMutation.mutateAsync({ updatePredictions: true, asyncMode: true });
+      if (res.data?.job_id) {
+        setRetrainJobId(res.data.job_id);
+        setNotification({ type: 'info', message: res.data.message || 'Training job queued.' });
+        return;
+      }
       setNotification({
         type: 'success',
-        title: `Model v${res.data?.version || activeModel?.version} Successfully Retrained & Promoted!`,
-        message: `${res.data?.message || 'New model active in production.'} Generated ${res.data?.recommendations_updated || 248} fresh stock recommendations.`,
+        title: 'Model Retraining Completed',
+        message: `${res.data?.message || 'Model training completed.'} Generated ${res.data?.recommendations_updated ?? 0} fresh stock recommendations.`,
         stats: res.data?.metrics,
       });
       refetchModels();
@@ -126,7 +182,7 @@ export default function Models() {
     }
   };
 
-  const isBusy = retrainMutation.isPending || predictMutation.isPending;
+  const isBusy = retrainMutation.isPending || predictMutation.isPending || Boolean(retrainJobId);
 
   return (
     <div className="space-y-6">
@@ -139,6 +195,9 @@ export default function Models() {
           </h1>
           <p className="text-xs text-slate-400 mt-1">
             LightGBM calibrated binary classifier predicting 10-day alpha over ASPI benchmark net of transaction costs.
+          </p>
+          <p className="text-[11px] text-slate-500 mt-1">
+            Retraining reads existing database history; it does not fetch data from the internet.
           </p>
         </div>
 
@@ -162,9 +221,14 @@ export default function Models() {
             onClick={handleRetrain}
             disabled={isBusy}
             className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold px-5 py-2.5 rounded-xl text-xs transition shadow-lg shadow-blue-600/20 disabled:opacity-60 disabled:cursor-not-allowed"
-            title="Retrain LightGBM on latest features dataset, evaluate validation metrics, promote to active, and update recommendations"
+            title="Train from stored features, monitor progress, evaluate the holdout, and update recommendations"
           >
-            {retrainMutation.isPending ? (
+            {isBusy && retrainJobId ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Training {retrainStatus?.progress ?? 0}%</span>
+              </>
+            ) : retrainMutation.isPending ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
                 <span>Retraining &amp; Updating...</span>
@@ -193,19 +257,36 @@ export default function Models() {
           <div className="space-y-1">
             {notification.title && <p className="font-bold text-sm text-white">{notification.title}</p>}
             <p className="text-xs leading-relaxed">{notification.message}</p>
+            {retrainJobId && retrainStatus && (
+              <div className="pt-2 space-y-1.5">
+                <div className="flex justify-between text-[11px] text-slate-300">
+                  <span>{retrainStatus.stage?.replaceAll('_', ' ') || 'starting'}</span>
+                  <span>{retrainStatus.progress ?? 0}%</span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded bg-slate-800">
+                  <div
+                    className="h-full rounded bg-blue-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, retrainStatus.progress ?? 0))}%` }}
+                  />
+                </div>
+                {retrainStatus.message && (
+                  <p className="text-[11px] leading-relaxed text-slate-400">{retrainStatus.message}</p>
+                )}
+              </div>
+            )}
             {notification.stats && (
               <div className="flex flex-wrap gap-3 pt-2 text-[11px]">
                 <span className="bg-slate-900/60 px-2.5 py-0.5 rounded border border-slate-700 text-slate-300">
                   Train Samples: <strong>{notification.stats.train_samples}</strong>
                 </span>
                 <span className="bg-slate-900/60 px-2.5 py-0.5 rounded border border-slate-700 text-slate-300">
-                  Val AUC: <strong>{notification.stats.val_auc}</strong>
+                  Val AUC: <strong>{notification.stats.val_auc ?? '—'}</strong>
                 </span>
                 <span className="bg-slate-900/60 px-2.5 py-0.5 rounded border border-slate-700 text-slate-300">
-                  Accuracy: <strong>{notification.stats.accuracy}%</strong>
+                  Accuracy: <strong>{notification.stats.accuracy != null ? `${notification.stats.accuracy}%` : '—'}</strong>
                 </span>
                 <span className="bg-slate-900/60 px-2.5 py-0.5 rounded border border-slate-700 text-slate-300">
-                  Best Iteration: <strong>{notification.stats.best_iteration}</strong>
+                  Best Iteration: <strong>{notification.stats.best_iteration ?? '—'}</strong>
                 </span>
               </div>
             )}
@@ -262,23 +343,37 @@ export default function Models() {
                 <h2 className="font-bold text-lg text-white">
                   {activeModel ? `${activeModel.model_name} (v${activeModel.version})` : 'CSE LightGBM Alpha'}
                 </h2>
-                <span className="text-[10px] font-bold uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full">
-                  Active in Production
+                <span className={`text-[10px] font-bold uppercase px-2.5 py-0.5 rounded-full ${
+                  activeModel
+                    ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                    : 'bg-slate-800 text-slate-400 border border-slate-700'
+                }`}>
+                  {activeModel ? 'Active in Production' : 'No Active Model'}
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5 flex items-center gap-1.5 flex-wrap">
                 <span>Target: Beat ASPI Benchmark + 2.68% round-trip costs</span>
                 <InfoTooltip termId="cost_hurdle" />
-                <span>&bull; Trained with <strong className="text-slate-200">{trainSamples.toLocaleString()} samples</strong></span>
+                <span>&bull; Trained with <strong className="text-slate-200">
+                  {trainSamples != null ? Number(trainSamples).toLocaleString() : '—'} samples
+                </strong></span>
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
             <span className="text-xs text-slate-400">Safety Gate:</span>
-            <span className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/25 flex items-center gap-1.5">
-              <CheckCircle className="w-3.5 h-3.5" />
-              <span>Passed (Beats Market + All Broker Fees)</span>
+            <span className={`text-xs font-semibold px-2.5 py-1 rounded-lg border flex items-center gap-1.5 ${
+              !hasGateMetrics
+                ? 'bg-slate-800 text-slate-400 border-slate-700'
+                : safetyGatePassed
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/25'
+                : 'bg-rose-500/10 text-rose-400 border-rose-500/25'
+            }`}>
+              {hasGateMetrics && safetyGatePassed && <CheckCircle className="w-3.5 h-3.5" />}
+              <span>
+                {!hasGateMetrics ? 'Not Evaluated' : safetyGatePassed ? 'Passed (Holdout Gates)' : 'Not Passed'}
+              </span>
             </span>
           </div>
         </div>
@@ -290,32 +385,48 @@ export default function Models() {
               <span>Sharpe Ratio</span>
               <InfoTooltip termId="sharpe_ratio" />
             </div>
-            <div className="text-2xl font-bold text-slate-100 mt-1">{Number(sharpe).toFixed(2)}</div>
-            <span className="text-[11px] text-emerald-400 font-medium">Risk-adjusted return rating</span>
+            <div className="text-2xl font-bold text-slate-100 mt-1">
+              {formatMetric(sharpe)}
+            </div>
+            <span className="text-[11px] text-emerald-400 font-medium">
+              {noHoldoutTrades ? 'Cash-return convention; no holdout trades' : 'Risk-adjusted return rating'}
+            </span>
           </div>
           <div>
             <div className="text-xs text-slate-400 flex items-center gap-1">
               <span>Win Rate (Profits)</span>
               <InfoTooltip termId="win_rate" />
             </div>
-            <div className="text-2xl font-bold text-slate-100 mt-1">{Number(winRate).toFixed(1)}%</div>
-            <span className="text-[11px] text-slate-400">% of profitable trades</span>
+            <div className="text-2xl font-bold text-slate-100 mt-1">
+              {winRate == null ? '—' : `${formatMetric(winRate, 1)}%`}
+            </div>
+            <span className="text-[11px] text-slate-400">
+              {noHoldoutTrades ? 'No closed holdout trades' : '% of profitable trades'}
+            </span>
           </div>
           <div>
             <div className="text-xs text-slate-400 flex items-center gap-1">
               <span>Validation Accuracy</span>
               <InfoTooltip title="Validation Accuracy" text="How accurately the model projected prices on unseen historical CSE test data." />
             </div>
-            <div className="text-2xl font-bold text-blue-400 mt-1">{Number(accuracy).toFixed(1)}%</div>
-            <span className="text-[11px] text-slate-400">AUC Score: {Number(valAuc).toFixed(2)}</span>
+            <div className="text-2xl font-bold text-blue-400 mt-1">
+              {accuracy == null ? '—' : `${formatMetric(accuracy, 1)}%`}
+            </div>
+            <span className="text-[11px] text-slate-400">AUC Score: {formatMetric(valAuc)}</span>
           </div>
           <div>
             <div className="text-xs text-slate-400 flex items-center gap-1">
               <span>Excess Return Net</span>
               <InfoTooltip termId="cost_hurdle" />
             </div>
-            <div className="text-2xl font-bold text-emerald-400 mt-1">+{Number(excessRet).toFixed(1)}%</div>
-            <span className="text-[11px] text-emerald-400">Pure profit after 2.68% fees</span>
+            <div className="text-2xl font-bold text-emerald-400 mt-1">
+              {excessRet == null
+                ? '—'
+                : `${Number(excessRet) >= 0 ? '+' : ''}${formatMetric(excessRet, 1)}%`}
+            </div>
+            <span className="text-[11px] text-slate-400">
+              {noHoldoutTrades ? 'Uninvested cash vs ASPI' : 'Net excess return versus ASPI'}
+            </span>
           </div>
         </div>
       </div>
@@ -435,7 +546,9 @@ export default function Models() {
               Which technical indicators gave the AI model the strongest edge in forecasting 10-day alpha.
             </p>
           </div>
-          <span className="text-xs text-slate-500 font-mono">Early stopping at iteration #{bestIter}</span>
+          <span className="text-xs text-slate-500 font-mono">
+            {bestIter != null ? `Early stopping at iteration #${bestIter}` : 'No evaluation run yet'}
+          </span>
         </div>
 
         {/* Beginner Context Box */}
@@ -448,6 +561,9 @@ export default function Models() {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+          {featuresList.length === 0 && (
+            <p className="text-xs text-slate-500">Feature importance is unavailable until a model evaluation completes.</p>
+          )}
           {featuresList.map((item, idx) => {
             const meta = item.meta || getFeatureMeta(item.feat);
             return (

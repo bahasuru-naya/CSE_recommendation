@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date
 import logging
+from collections.abc import Callable
+from datetime import date
 from typing import Any
 
 from sqlalchemy import text
@@ -59,7 +60,13 @@ class IngestionOrchestrator:
         res_market = self.market_data.sync_indices_and_summary(t_date)
         return {"trade_summary": res_trade, "market": res_market}
 
-    def backfill_history(self, symbols: list[str] | None = None, period: int = 5, limit: int = 50) -> dict[str, Any]:
+    def backfill_history(
+        self,
+        symbols: list[str] | None = None,
+        period: int = 5,
+        limit: int = 50,
+        progress_callback: Callable[[int, int, str, int, str | None], None] | None = None,
+    ) -> dict[str, Any]:
         """Backfill historical chart data for top symbols using their verified stock IDs.
         
         Period 5 fetches 1 full year (~245 trading days), which is the maximum available
@@ -106,7 +113,11 @@ class IngestionOrchestrator:
             pairs = [(s, known.get(s)) for s in (symbols or list(known.keys()))]
 
         logger.info("Backfilling history for %d symbols with period %d...", len(pairs), period)
-        return self.chart_data.sync_symbols(pairs, period=period)
+        return self.chart_data.sync_symbols(
+            pairs,
+            period=period,
+            progress_callback=progress_callback,
+        )
 
     def run_canary(self) -> dict[str, Any]:
         """Hit key CSE API endpoints to verify reachability and schema."""

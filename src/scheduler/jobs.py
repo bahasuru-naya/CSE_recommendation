@@ -27,6 +27,7 @@ class PipelineScheduler:
 
     def __init__(self):
         self.scheduler = BackgroundScheduler(timezone=COLOMBO_TZ)
+        self._last_telegram_alert_slot: tuple[date, str] | None = None
 
     def _record_run(self, job_id: str, func: Callable, *args, **kwargs):
         """Wrapper to track job run start, completion, and errors in app.job_runs."""
@@ -77,6 +78,32 @@ class PipelineScheduler:
         finally:
             session.close()
 
+    def _register_job_records(self):
+        """Create the database rows required by job-run tracking."""
+        jobs = (
+            ("intraday_snapshot", "Intraday Price Snapshot", "interval_5m"),
+            ("eod_fetch", "EOD Ingestion & Recommendations", "cron_14:45"),
+            ("telegram_alerts", "Daily Telegram Alerts", "daily"),
+        )
+        session = SessionLocal()
+        try:
+            for job_id, name, schedule_type in jobs:
+                session.execute(
+                    text("""
+                        INSERT INTO app.jobs (job_id, job_name, schedule_type)
+                        VALUES (:job_id, :name, :schedule_type)
+                        ON CONFLICT (job_id) DO NOTHING
+                    """),
+                    {"job_id": job_id, "name": name, "schedule_type": schedule_type},
+                )
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("Could not register scheduled jobs.")
+            raise
+        finally:
+            session.close()
+
     def job_intraday_snapshot(self):
         """Intraday price snapshot during active trading hours."""
         if not is_market_hours():
@@ -113,7 +140,6 @@ class PipelineScheduler:
             # Build features & update daily recommendations
             from src.features.builder import FeatureBuilder
             from src.engine.decision import DecisionEngine
-            from src.alerts.telegram import TelegramAlerter
 
             feat_builder = FeatureBuilder(session)
             feat_builder.build_all_features(t_date)
@@ -121,9 +147,8 @@ class PipelineScheduler:
             engine = DecisionEngine(session)
             recs = engine.run(t_date)
 
-            alerter = TelegramAlerter()
-            for r in recs[:3]:
-                alerter.send_recommendation(r)
+            # Filter out kill-switch warning dicts (not real recommendations)
+            real_recs = [r for r in recs if not (isinstance(r, dict) and "warning" in r)]
 
             return {
                 "trading_date": str(t_date),
@@ -131,10 +156,110 @@ class PipelineScheduler:
                 "prices_promoted": promoted_prices,
                 "indices_promoted": promoted_indices,
                 "reconciliation": recon_report,
-                "recommendations_generated": len(recs),
+                "recommendations_generated": len(real_recs),
             }
         finally:
             session.close()
+
+    def job_telegram_alerts(self):
+        """Send the latest recommendations for the current trading date."""
+        from src.alerts.telegram import TelegramAlerter
+
+        session = SessionLocal()
+        try:
+            recommendations = session.execute(
+                text("""
+                    SELECT signal, symbol, security_name, confidence, entry_price_low,
+                           entry_price_high, stop_loss, target_price, max_quantity,
+                           position_size_pct, horizon_days
+                    FROM app.recommendations
+                    WHERE recommendation_date = :trading_date AND status = 'active'
+                    ORDER BY confidence DESC NULLS LAST
+                    LIMIT 3
+                """),
+                {"trading_date": trading_date()},
+            ).mappings().all()
+            if not recommendations:
+                logger.info("No current recommendations to send to Telegram.")
+                return {"sent": 0, "reason": "no_recommendations"}
+
+            alerter = TelegramAlerter(db=session)
+            failed = sum(not alerter.send_recommendation(dict(rec)) for rec in recommendations)
+            if failed:
+                raise RuntimeError(f"Telegram failed to send {failed} recommendation alert(s).")
+            return {"sent": len(recommendations)}
+        finally:
+            session.close()
+
+    def _check_telegram_alert_schedule(self):
+        """Check the persisted daily alert time and run alerts when it matches."""
+        now = datetime.now(COLOMBO_TZ)
+        if now.weekday() >= 5:
+            return
+
+        session = SessionLocal()
+        try:
+            value = session.execute(
+                text("SELECT value FROM app.settings WHERE key = 'telegram'")
+            ).scalar()
+        finally:
+            session.close()
+
+        alert_time = value.get("alert_time", "15:00") if isinstance(value, dict) else "15:00"
+        slot = (now.date(), alert_time)
+        if (
+            self._last_telegram_alert_slot == slot
+            or (
+                isinstance(value, dict)
+                and value.get("last_sent_date") == now.date().isoformat()
+                and value.get("last_sent_time") == alert_time
+            )
+        ):
+            return
+        if now.strftime("%H:%M") < alert_time:
+            return
+
+        session = SessionLocal()
+        try:
+            has_recommendations = bool(
+                session.execute(
+                    text("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM app.recommendations
+                            WHERE recommendation_date = :trading_date AND status = 'active'
+                        )
+                    """),
+                    {"trading_date": trading_date(now)},
+                ).scalar()
+            )
+        finally:
+            session.close()
+        if not has_recommendations:
+            return
+
+        self._last_telegram_alert_slot = slot
+        try:
+            result = self.job_telegram_alerts()
+            logger.info("Scheduled Telegram alerts completed: %s", result)
+            if result.get("sent", 0):
+                session = SessionLocal()
+                try:
+                    value = dict(value) if isinstance(value, dict) else {}
+                    value["last_sent_date"] = now.date().isoformat()
+                    value["last_sent_time"] = alert_time
+                    session.execute(
+                        text("""
+                            UPDATE app.settings
+                            SET value = CAST(:value AS JSONB), updated_at = NOW()
+                            WHERE key = 'telegram'
+                        """),
+                        {"value": json.dumps(value)},
+                    )
+                    session.commit()
+                finally:
+                    session.close()
+        except Exception:
+            logger.exception("Scheduled Telegram alerts failed.")
 
     def catch_up(self):
         """Check for missed trading days when system was offline and run EOD catchup."""
@@ -165,6 +290,7 @@ class PipelineScheduler:
     def start(self):
         """Register all jobs and start APScheduler."""
         logger.info("Starting Pipeline Scheduler...")
+        self._register_job_records()
         self.catch_up()
 
         # 1. Intraday snapshot every 5 min Mon-Fri 09:30 - 14:30
@@ -185,5 +311,18 @@ class PipelineScheduler:
             replace_existing=True,
         )
 
+        self.scheduler.add_job(
+            func=self._check_telegram_alert_schedule,
+            trigger=CronTrigger(minute="*", timezone=COLOMBO_TZ),
+            id="telegram_alert_clock",
+            name="Check Telegram Alert Schedule",
+            replace_existing=True,
+        )
+
         self.scheduler.start()
         logger.info("Pipeline Scheduler is active.")
+
+    def stop(self):
+        """Stop the background scheduler."""
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)

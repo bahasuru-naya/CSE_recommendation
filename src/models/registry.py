@@ -72,10 +72,50 @@ class ModelRegistry:
         self.session.commit()
         logger.info("Promoted model id %d to active", model_id)
 
+    def prune_old_versions(self, model_name: str, keep: int = 5) -> int:
+        """Delete older versions and their dependent history, retaining the newest versions."""
+        if keep < 1:
+            raise ValueError("At least one model version must be retained.")
+
+        old_rows = self.session.execute(
+            text("""
+                SELECT model_id
+                FROM ml.model_registry
+                WHERE model_name = :name
+                ORDER BY version DESC
+                OFFSET :keep
+            """),
+            {"name": model_name, "keep": keep},
+        ).fetchall()
+        old_model_ids = [row[0] for row in old_rows]
+        if not old_model_ids:
+            return 0
+
+        dependent_tables = (
+            "ml.training_runs",
+            "ml.predictions",
+            "ml.backtests",
+            "ml.drift_metrics",
+        )
+        for model_id in old_model_ids:
+            for table in dependent_tables:
+                self.session.execute(
+                    text(f"DELETE FROM {table} WHERE model_id = :model_id"),
+                    {"model_id": model_id},
+                )
+            self.session.execute(
+                text("DELETE FROM ml.model_registry WHERE model_id = :model_id"),
+                {"model_id": model_id},
+            )
+
+        self.session.commit()
+        logger.info("Pruned %d old versions of model %s; retaining %d.", len(old_model_ids), model_name, keep)
+        return len(old_model_ids)
+
     def get_active_model(self) -> tuple[int, CSELightGBMModel, dict[str, Any]] | None:
         """Load currently active model from ml.model_registry."""
         query = text("""
-            SELECT model_id, model_name, version, hyperparameters, feature_columns, model_binary
+            SELECT model_id, model_name, version, hyperparameters, feature_columns, metrics, model_binary
             FROM ml.model_registry
             WHERE is_active = TRUE
             ORDER BY promoted_at DESC
@@ -85,9 +125,9 @@ class ModelRegistry:
         if not row:
             return None
 
-        model_id, name, ver, params, feats, bin_data = row
+        model_id, name, ver, params, feats, metrics, bin_data = row
         model = CSELightGBMModel.from_bytes(bytes(bin_data))
-        metadata = {"model_name": name, "version": ver, "features": feats}
+        metadata = {"model_name": name, "version": ver, "features": feats, "metrics": metrics}
         return model_id, model, metadata
 
     def check_promotion_gate(self, backtest_excess_return: float, sharpe_ratio: float) -> bool:

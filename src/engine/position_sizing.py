@@ -29,8 +29,15 @@ class PositionSizer:
         stop_loss: float,
         avg_daily_volume: float,
         confidence: float = 0.70,
+        position_scale: float = 1.0,
     ) -> dict[str, Any]:
-        """Determine position quantity constrained by stop distance, portfolio cap, and average volume."""
+        """Determine position quantity constrained by stop distance, portfolio cap, and average volume.
+
+        Args:
+            position_scale: Regime-driven multiplier (e.g. 0.5 during HIGH_VOLATILITY,
+                            0.25 during BEARISH, 1.0 during BULLISH) applied after all
+                            other constraints so the final quantity respects the market regime.
+        """
         if entry_price <= 0 or stop_loss >= entry_price:
             return {"quantity": 0, "position_size_pct": 0.0, "reason": "Invalid entry or stop price"}
 
@@ -46,8 +53,9 @@ class PositionSizer:
         # 3. Liquidity constraint: max % of average daily volume
         liq_qty = int(avg_daily_volume * self.max_volume_pct) if avg_daily_volume > 0 else 1000
 
-        # Choose conservative minimum
-        final_qty = max(0, min(risk_qty, cap_qty, liq_qty))
+        # Choose conservative minimum, then apply regime position_scale
+        raw_qty = max(0, min(risk_qty, cap_qty, liq_qty))
+        final_qty = max(0, int(raw_qty * position_scale))
         position_value = final_qty * entry_price
         pos_pct = round(position_value / self.portfolio_value, 4)
 
@@ -58,7 +66,8 @@ class PositionSizer:
             "risk_qty": risk_qty,
             "cap_qty": cap_qty,
             "liq_qty": liq_qty,
+            "position_scale": position_scale,
             "constrained_by": (
-                "liquidity" if final_qty == liq_qty else ("capital_cap" if final_qty == cap_qty else "risk")
+                "liquidity" if raw_qty == liq_qty else ("capital_cap" if raw_qty == cap_qty else "risk")
             ),
         }

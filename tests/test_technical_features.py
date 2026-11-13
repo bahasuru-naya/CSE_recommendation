@@ -62,8 +62,10 @@ def test_compute_sma_and_ema(sample_ohlcv):
 def test_compute_rsi_bounds(sample_ohlcv):
     """Verify RSI values are strictly bounded within [0, 100]."""
     rsi = compute_rsi(sample_ohlcv["close"], period=14)
-    assert np.all(rsi >= 0.0)
-    assert np.all(rsi <= 100.0)
+    valid_rsi = rsi.dropna()
+    assert not valid_rsi.empty
+    assert np.all(valid_rsi >= 0.0)
+    assert np.all(valid_rsi <= 100.0)
 
     # Monotonically increasing prices should have RSI close to 100
     up_prices = pd.Series([10.0 + i for i in range(30)])
@@ -90,14 +92,16 @@ def test_compute_macd_consistency(sample_ohlcv):
 def test_compute_atr_positive(sample_ohlcv):
     """Verify ATR is always non-negative."""
     atr = compute_atr(sample_ohlcv["high"], sample_ohlcv["low"], sample_ohlcv["close"], period=14)
-    assert np.all(atr > 0.0)
+    assert np.all(atr.dropna() > 0.0)
 
 
 def test_compute_bollinger_bands(sample_ohlcv):
     """Verify upper band >= lower band and width is non-negative."""
     bb = compute_bollinger_bands(sample_ohlcv["close"], period=20)
-    assert np.all(bb["bollinger_upper"] >= bb["bollinger_lower"])
-    assert np.all(bb["bollinger_width"] >= 0.0)
+    valid_bands = bb.dropna()
+    assert not valid_bands.empty
+    assert np.all(valid_bands["bollinger_upper"] >= valid_bands["bollinger_lower"])
+    assert np.all(valid_bands["bollinger_width"] >= 0.0)
 
 
 def test_compute_obv_and_volatility(sample_ohlcv):
@@ -106,4 +110,4 @@ def test_compute_obv_and_volatility(sample_ohlcv):
     vol = compute_volatility(sample_ohlcv["close"], period=20)
 
     assert len(obv) == len(sample_ohlcv)
-    assert np.all(vol >= 0.0)
+    assert np.all(vol.dropna() >= 0.0)

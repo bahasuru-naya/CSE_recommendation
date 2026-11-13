@@ -53,10 +53,10 @@ def cmd_daily(target_date=None):
         engine = DecisionEngine(session)
         recommendations = engine.run(t_date)
 
-        # 5. Telegram Alerts
-        alerter = TelegramAlerter()
-        for rec in recommendations[:3]:  # Top 3 signals
-            alerter.send_recommendation(rec)
+        alerter = TelegramAlerter(db=session)
+        for recommendation in recommendations[:3]:
+            if not (isinstance(recommendation, dict) and "warning" in recommendation):
+                alerter.send_recommendation(recommendation)
 
         logger.info("Daily pipeline completed successfully.")
     finally:

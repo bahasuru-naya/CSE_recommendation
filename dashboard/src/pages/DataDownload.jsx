@@ -51,6 +51,7 @@ function StatusBadge({ status }) {
   const configs = {
     queued: { cls: 'bg-yellow-900/60 text-yellow-300 border border-yellow-700', icon: Clock, label: 'Queued' },
     running: { cls: 'bg-blue-900/60 text-blue-300 border border-blue-700', icon: Loader2, label: 'Running', spin: true },
+    partial: { cls: 'bg-amber-900/60 text-amber-300 border border-amber-700', icon: AlertCircle, label: 'Completed with warnings' },
     completed: { cls: 'bg-emerald-900/60 text-emerald-300 border border-emerald-700', icon: CheckCircle, label: 'Completed' },
     failed: { cls: 'bg-rose-900/60 text-rose-300 border border-rose-700', icon: XCircle, label: 'Failed' },
   };
@@ -76,6 +77,51 @@ function JobCard({ job }) {
       </div>
       {job.message && (
         <p className="text-sm text-slate-400">{job.message}</p>
+      )}
+      {job.status !== 'queued' && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-xs text-slate-400">
+            <span>{job.stage || 'Working'}</span>
+            <span>{Math.max(0, Math.min(100, Number(job.progress) || 0))}%</span>
+          </div>
+          <div
+            className="h-2 w-full overflow-hidden rounded-full bg-slate-700"
+            role="progressbar"
+            aria-label="Download progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.max(0, Math.min(100, Number(job.progress) || 0))}
+          >
+            <div
+              className="h-full rounded-full bg-blue-500 transition-all duration-300"
+              style={{ width: `${Math.max(0, Math.min(100, Number(job.progress) || 0))}%` }}
+            />
+          </div>
+          {job.total > 0 && (
+            <p className="text-xs text-slate-500">
+              Symbols: {job.processed || 0}/{job.total} • Succeeded: {job.symbols_succeeded || 0} • Failed: {job.symbols_failed || 0} • Rows: {(job.rows_downloaded || 0).toLocaleString()}
+            </p>
+          )}
+        </div>
+      )}
+      {job.error && (
+        <p className="text-xs text-rose-300">
+          Error: {job.error}
+        </p>
+      )}
+      {job.warnings?.length > 0 && (
+        <details className="text-xs text-amber-300">
+          <summary className="cursor-pointer">
+            {job.warnings_count || job.warnings.length} symbol warning(s)
+          </summary>
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-slate-400">
+            {job.warnings.map((warning) => (
+              <li key={`${warning.symbol}-${warning.error}`}>
+                {warning.symbol}: {warning.error}
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
       <div className="flex flex-wrap gap-4 text-xs text-slate-500 pt-1 border-t border-slate-700">
         {job.started_at && (
@@ -238,6 +284,7 @@ export default function DataDownload() {
   };
 
   const activeJobs = Array.isArray(jobs) ? jobs : (jobs ? [jobs] : []);
+  const hasActiveDownload = activeJobs.some((job) => ['queued', 'running'].includes(job.status));
 
   return (
     <div className="min-h-screen bg-slate-950 p-6 space-y-6">
@@ -370,7 +417,7 @@ export default function DataDownload() {
             {/* Submit */}
             <button
               onClick={handleStart}
-              disabled={triggerDownload.isPending}
+              disabled={triggerDownload.isPending || hasActiveDownload}
               className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold py-3 px-4 rounded-lg transition-colors text-sm"
             >
               {triggerDownload.isPending ? (
@@ -381,7 +428,7 @@ export default function DataDownload() {
               ) : (
                 <>
                   <Download className="w-4 h-4" />
-                  Start CSE API Download
+                  {hasActiveDownload ? 'Download in progress…' : 'Start CSE API Download'}
                 </>
               )}
             </button>
